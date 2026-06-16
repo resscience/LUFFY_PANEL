@@ -22,19 +22,12 @@ logger = logging.getLogger("Luffy-Gateway")
 
 app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
 
-# ── Render-Ready: all config from environment variables ──────────────────────
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
 }
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 connections: dict = {}
 connection_sockets: dict = {}
@@ -47,33 +40,25 @@ http_client: httpx.AsyncClient | None = None
 
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
-
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
-
-# ── Unlimited sentinel used in Subscription-UserInfo header ─────────────────
-UNLIMITED_QUOTA_BYTES = 53687091200000   # ~50 TB; signals "no cap" to clients
-
+UNLIMITED_QUOTA_BYTES = 53687091200000
 
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-
-# Render-Ready: password from env var
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
-
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
         SESSIONS[token] = time.time() + SESSION_TTL
     return token
-
 
 async def is_valid_session(token: str | None) -> bool:
     if not token:
@@ -85,19 +70,16 @@ async def is_valid_session(token: str | None) -> bool:
             return False
         return True
 
-
 async def destroy_session(token: str | None):
     if token:
         async with SESSIONS_LOCK:
             SESSIONS.pop(token, None)
-
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not await is_valid_session(token):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
-
 
 async def keep_alive():
     while True:
@@ -107,10 +89,8 @@ async def keep_alive():
             if domain and domain != "localhost":
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     await client.get(f"https://{domain}/health")
-                logger.info("Keep-alive ping sent")
         except Exception:
             pass
-
 
 @app.on_event("startup")
 async def startup():
@@ -118,159 +98,94 @@ async def startup():
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
-    logger.info(f"Luffy Panel started on port {CONFIG['port']}")
     asyncio.create_task(keep_alive())
-
 
 @app.on_event("shutdown")
 async def shutdown():
     if http_client:
         await http_client.aclose()
 
-
 def get_domain() -> str:
-    return (
-        os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
-        .replace("https://", "")
-        .replace("http://", "")
-    )
-
+    return (os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")).replace("https://", "").replace("http://", ""))
 
 def generate_uuid(seed: str | None = None) -> str:
     if seed is None:
-        return (
-            str(secrets.token_hex(16))[:8]
-            + "-"
-            + secrets.token_hex(2)
-            + "-"
-            + secrets.token_hex(2)
-            + "-"
-            + secrets.token_hex(2)
-            + "-"
-            + secrets.token_hex(6)
-        )
+        return (str(secrets.token_hex(16))[:8]+"-"+secrets.token_hex(2)+"-"+secrets.token_hex(2)+"-"+secrets.token_hex(2)+"-"+secrets.token_hex(6))
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
-
 
 def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None) -> str:
     domain = get_domain()
     addr = address if address else domain
     path = f"/ws/{uuid}"
-    params = {
-        "encryption": "none",
-        "security": "tls",
-        "type": "ws",
-        "host": domain,
-        "path": path,
-        "sni": domain,
-        "fp": "chrome",
-        "alpn": "http/1.1",
-    }
+    params = {"encryption": "none", "security": "tls", "type": "ws", "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"}
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
-
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
     h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
 def parse_size_to_bytes(value: float, unit: str) -> int:
     unit = unit.upper()
-    if unit == "GB":
-        return int(value * 1024 * 1024 * 1024)
-    if unit == "MB":
-        return int(value * 1024 * 1024)
-    if unit == "KB":
-        return int(value * 1024)
+    if unit == "GB": return int(value * 1024 * 1024 * 1024)
+    if unit == "MB": return int(value * 1024 * 1024)
+    if unit == "KB": return int(value * 1024)
     return int(value)
 
-
-# ── Fix #2: safe expires_at parser (handles "Z" suffix and naive datetimes) ─
 def parse_expires_at(raw: str | None) -> datetime | None:
-    """Return a timezone-aware datetime (UTC) or None if not set / invalid."""
-    if not raw:
-        return None
+    if not raw: return None
     try:
-        # Replace trailing "Z" with "+00:00" so fromisoformat works on all Python versions
         normalised = raw.replace("Z", "+00:00")
         dt = datetime.fromisoformat(normalised)
-        # If still naive (no tzinfo), assume UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
         return dt
-    except Exception:
-        return None
-
+    except Exception: return None
 
 def seconds_until_expiry(expires_at_str: str | None) -> int | None:
-    """Return seconds remaining, 0 if expired, None if unlimited."""
     exp = parse_expires_at(expires_at_str)
-    if exp is None:
-        return None
+    if exp is None: return None
     remaining = (exp - datetime.now(timezone.utc)).total_seconds()
     return max(0, int(remaining))
-
 
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            LINKS["Default"] = {
-                "label": "Default",
-                "limit_bytes": 0,
-                "used_bytes": 0,
-                "max_connections": 0,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "active": True,
-                "expires_at": None,
-            }
-
+            LINKS["Default"] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now(timezone.utc).isoformat(), "active": True, "expires_at": None}
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if websocket.client:
-        return websocket.client.host
+    if forwarded: return forwarded.split(",")[0].strip()
+    if websocket.client: return websocket.client.host
     return "unknown"
-
 
 def count_connections_for_link(uid: str) -> int:
     return len(link_ip_map.get(uid, set()))
 
-
 def remove_ip_from_link(uid: str, ip: str):
     if uid in link_ip_map:
         link_ip_map[uid].discard(ip)
-        if not link_ip_map[uid]:
-            link_ip_map.pop(uid, None)
-
+        if not link_ip_map[uid]: link_ip_map.pop(uid, None)
 
 async def close_connections_for_link(uid: str):
     to_close = [cid for cid, info in connections.items() if info.get("uuid") == uid]
     for cid in to_close:
         ws = connection_sockets.get(cid)
         if ws:
-            try:
-                await ws.close(code=1000, reason="link deleted")
-            except Exception:
-                pass
+            try: await ws.close(code=1000, reason="link deleted")
+            except Exception: pass
         connections.pop(cid, None)
         connection_sockets.pop(cid, None)
     link_ip_map.pop(uid, None)
-
 
 @app.get("/")
 async def root():
     return {"service": "Luffy Panel", "version": "1.0", "status": "active", "domain": get_domain()}
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "connections": len(connections), "uptime": uptime()}
-
 
 @app.post("/api/login")
 async def api_login(request: Request):
@@ -280,16 +195,8 @@ async def api_login(request: Request):
         raise HTTPException(status_code=401, detail="Invalid password")
     token = await create_session()
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        key=SESSION_COOKIE,
-        value=token,
-        max_age=SESSION_TTL,
-        httponly=True,
-        samesite="lax",
-        path="/",
-    )
+    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
-
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
@@ -299,12 +206,10 @@ async def api_logout(request: Request):
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
 
-
 @app.get("/api/me")
 async def api_me(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     return {"authenticated": await is_valid_session(token)}
-
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, _=Depends(require_auth)):
@@ -319,694 +224,356 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     current_token = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
-        if current_token:
-            SESSIONS[current_token] = time.time() + SESSION_TTL
+        if current_token: SESSIONS[current_token] = time.time() + SESSION_TTL
     return {"ok": True}
-
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
-    return {
-        "active_connections": len(connections),
-        "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
-        "total_requests": stats["total_requests"],
-        "total_errors": stats["total_errors"],
-        "uptime": uptime(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "recent_errors": list(error_logs)[-10:],
-        "links_count": len(LINKS),
-        "domain": get_domain(),
-        "cpu_percent": psutil.cpu_percent(interval=0.1),
-        "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(hourly_traffic),
-    }
+    return {"active_connections": len(connections), "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2), "total_requests": stats["total_requests"], "total_errors": stats["total_errors"], "uptime": uptime(), "timestamp": datetime.now(timezone.utc).isoformat(), "recent_errors": list(error_logs)[-10:], "links_count": len(LINKS), "domain": get_domain(), "cpu_percent": psutil.cpu_percent(interval=0.1), "memory_percent": psutil.virtual_memory().percent, "hourly_traffic": dict(hourly_traffic)}
 
-
-# ── Feature #5: receive days_valid, compute expires_at ──────────────────────
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
-        raise HTTPException(
-            status_code=400,
-            detail="Inbound name must contain only English letters, numbers, and characters: - _ . space",
-        )
+        raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
     if not label:
         raise HTTPException(status_code=400, detail="Inbound name is required")
     async with LINKS_LOCK:
         if label in LINKS:
             raise HTTPException(status_code=400, detail="An inbound with this name already exists")
-
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
     max_conn = int(body.get("max_connections") or 0)
-    if max_conn < 0:
-        max_conn = 0
-
-    # Feature #5: days_valid → expires_at (UTC-aware ISO string)
+    if max_conn < 0: max_conn = 0
     days_valid = body.get("days_valid")
     expires_at: str | None = None
     if days_valid is not None:
         try:
             days_valid = int(days_valid)
             if days_valid > 0:
-                expires_at = (
-                    datetime.now(timezone.utc) + timedelta(days=days_valid)
-                ).isoformat()
-        except (ValueError, TypeError):
-            pass
-
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
+        except (ValueError, TypeError): pass
     uid = label
     async with LINKS_LOCK:
-        LINKS[uid] = {
-            "label": label,
-            "limit_bytes": limit_bytes,
-            "used_bytes": 0,
-            "max_connections": max_conn,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "active": True,
-            "expires_at": expires_at,
-        }
-    return {
-        "uuid": uid,
-        "label": label,
-        "limit_bytes": limit_bytes,
-        "used_bytes": 0,
-        "max_connections": max_conn,
-        "active": True,
-        "created_at": LINKS[uid]["created_at"],
-        "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
-    }
-
+        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now(timezone.utc).isoformat(), "active": True, "expires_at": expires_at}
+    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"], "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}")}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
-            result.append(
-                {
-                    "uuid": uid,
-                    "label": data["label"],
-                    "limit_bytes": data["limit_bytes"],
-                    "used_bytes": data["used_bytes"],
-                    "max_connections": data.get("max_connections", 0),
-                    "active": data["active"],
-                    "created_at": data["created_at"],
-                    "expires_at": data.get("expires_at"),
-                    "current_connections": count_connections_for_link(uid),
-                    "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}"),
-                }
-            )
+            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "created_at": data["created_at"], "expires_at": data.get("expires_at"), "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}")})
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
-
 
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
-        if uid not in LINKS:
-            raise HTTPException(status_code=404, detail="link not found")
-        if "active" in body:
-            LINKS[uid]["active"] = bool(body["active"])
+        if uid not in LINKS: raise HTTPException(status_code=404, detail="link not found")
+        if "active" in body: LINKS[uid]["active"] = bool(body["active"])
         if "limit_value" in body:
             limit_value = float(body.get("limit_value") or 0)
             limit_unit = body.get("limit_unit") or "GB"
-            LINKS[uid]["limit_bytes"] = (
-                0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-            )
-        if "reset_usage" in body and body["reset_usage"]:
-            LINKS[uid]["used_bytes"] = 0
-        if "label" in body:
-            LINKS[uid]["label"] = str(body["label"])[:60]
+            LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+        if "reset_usage" in body and body["reset_usage"]: LINKS[uid]["used_bytes"] = 0
+        if "label" in body: LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
-        # Allow updating days_valid via PATCH
         if "days_valid" in body:
             try:
                 dv = int(body["days_valid"])
-                if dv > 0:
-                    LINKS[uid]["expires_at"] = (
-                        datetime.now(timezone.utc) + timedelta(days=dv)
-                    ).isoformat()
-                else:
-                    LINKS[uid]["expires_at"] = None
-            except (ValueError, TypeError):
-                pass
+                if dv > 0: LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=dv)).isoformat()
+                else: LINKS[uid]["expires_at"] = None
+            except (ValueError, TypeError): pass
     return {"ok": True}
-
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    async with LINKS_LOCK:
-        LINKS.pop(uid, None)
+    async with LINKS_LOCK: LINKS.pop(uid, None)
     await close_connections_for_link(uid)
     return {"ok": True}
 
-
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    async with CUSTOM_ADDRESSES_LOCK:
-        return {"addresses": list(CUSTOM_ADDRESSES)}
-
+    async with CUSTOM_ADDRESSES_LOCK: return {"addresses": list(CUSTOM_ADDRESSES)}
 
 @app.post("/api/addresses")
 async def add_address(request: Request, _=Depends(require_auth)):
     body = await request.json()
     address = (body.get("address") or "").strip()
-    if not address:
-        raise HTTPException(status_code=400, detail="Address is required")
-    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
-        raise HTTPException(
-            status_code=400,
-            detail="Address must contain only English letters, numbers, and characters: - _ .",
-        )
+    if not address: raise HTTPException(status_code=400, detail="Address is required")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address): raise HTTPException(status_code=400, detail="Address must contain only English letters, numbers, and characters: - _ .")
     async with CUSTOM_ADDRESSES_LOCK:
-        if address in CUSTOM_ADDRESSES:
-            raise HTTPException(status_code=400, detail="Address already exists")
+        if address in CUSTOM_ADDRESSES: raise HTTPException(status_code=400, detail="Address already exists")
         CUSTOM_ADDRESSES.append(address)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
-
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
     async with CUSTOM_ADDRESSES_LOCK:
-        if 0 <= index < len(CUSTOM_ADDRESSES):
-            CUSTOM_ADDRESSES.pop(index)
-        else:
-            raise HTTPException(status_code=404, detail="Address not found")
+        if 0 <= index < len(CUSTOM_ADDRESSES): CUSTOM_ADDRESSES.pop(index)
+        else: raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
-
 
 @app.get("/api/links/{uid}/sub")
 async def get_subscription(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None:
-            raise HTTPException(status_code=404, detail="link not found")
-
+        if link is None: raise HTTPException(status_code=404, detail="link not found")
     vless_link = generate_vless_link(uid, remark=f"Luffy-{link['label']}")
-    used = link["used_bytes"]
-    limit = link["limit_bytes"]
-    used_mb = round(used / (1024 * 1024), 2)
-    limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
-    pct = round((used / limit) * 100, 1) if limit > 0 else 0
-    remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
-
+    used = link["used_bytes"]; limit = link["limit_bytes"]
+    used_mb = round(used / (1024 * 1024), 2); limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
+    pct = round((used / limit) * 100, 1) if limit > 0 else 0; remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
     import base64
-
-    sub_content = f"""# Luffy Panel Subscription
-# Label: {link['label']}
-# Used: {used_mb} MB / {limit_mb if limit > 0 else 'Unlimited'} MB
-# Remaining: {remaining_mb if limit > 0 else 'Unlimited'} MB
-# Usage: {pct}%
-# Status: {'Active' if link['active'] else 'Disabled'}
-# Expiry: Unlimited
-{vless_link}"""
+    sub_content = f"# Luffy Panel\n{vless_link}"
     encoded = base64.b64encode(sub_content.encode()).decode()
-    return {
-        "subscription_url": f"{get_domain()}/api/links/{uid}/sub",
-        "config": vless_link,
-        "label": link["label"],
-        "used_bytes": used,
-        "limit_bytes": limit,
-        "used_mb": used_mb,
-        "limit_mb": limit_mb,
-        "remaining_mb": remaining_mb,
-        "usage_percent": pct,
-        "active": link["active"],
-        "sub_base64": encoded,
-        "sub_text": sub_content,
-    }
-
-
-# ── Feature #4: generate subscription content with status pseudo-node ────────
-def generate_subscription_content(link: dict, uid: str, addresses: list[str]) -> str:
-    """Build the newline-separated VLESS link list, prepended by a status node."""
-    used = link["used_bytes"]
-    limit = link["limit_bytes"]
-    expires_at_str = link.get("expires_at")
-
-    # --- usage display ---
-    if limit == 0:
-        usage_str = f"{_fmt_bytes(used)} / ∞"
-    else:
-        usage_str = f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
-
-    # --- expiry display ---
-    secs_left = seconds_until_expiry(expires_at_str)
-    if secs_left is None:
-        expiry_str = "∞"
-    elif secs_left == 0:
-        expiry_str = "Expired"
-    else:
-        days_left = secs_left // 86400
-        expiry_str = f"{days_left} Days Left"
-
-    status_remark = f"📊 {usage_str} | ⏳ {expiry_str}"
-    # Fake status node: same UUID but points to an unreachable host so it never
-    # actually connects; it exists purely to display the remark in the client.
-    status_node = generate_vless_link(uid, remark=status_remark, address="0.0.0.0")
-
-    links_out = [status_node]
-    # Real server link
-    links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-Server"))
-    # Clean IP alternatives
-    for i, addr in enumerate(addresses):
-        remark = f"Luffy-{link['label']}-IP{i + 1}"
-        links_out.append(generate_vless_link(uid, remark=remark, address=addr))
-
-    return "\n".join(links_out)
-
+    return {"subscription_url": f"{get_domain()}/api/links/{uid}/sub", "config": vless_link, "label": link["label"], "used_bytes": used, "limit_bytes": limit, "used_mb": used_mb, "limit_mb": limit_mb, "remaining_mb": remaining_mb, "usage_percent": pct, "active": link["active"], "sub_base64": encoded, "sub_text": sub_content}
 
 def _fmt_bytes(b: int) -> str:
-    """Human-readable size for the pseudo-node remark."""
-    if b >= 1_073_741_824:
-        return f"{b / 1_073_741_824:.1f}GB"
-    if b >= 1_048_576:
-        return f"{b / 1_048_576:.1f}MB"
+    if b >= 1_073_741_824: return f"{b / 1_073_741_824:.1f}GB"
+    if b >= 1_048_576: return f"{b / 1_048_576:.1f}MB"
     return f"{b / 1024:.1f}KB"
 
+def generate_subscription_content(link: dict, uid: str, addresses: list[str]) -> str:
+    used = link["used_bytes"]; limit = link["limit_bytes"]; expires_at_str = link.get("expires_at")
+    usage_str = f"{_fmt_bytes(used)} / ∞" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
+    secs_left = seconds_until_expiry(expires_at_str)
+    if secs_left is None: expiry_str = "∞"
+    elif secs_left == 0: expiry_str = "Expired"
+    else: expiry_str = f"{secs_left // 86400} Days Left"
+    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
+    links_out = [status_node, generate_vless_link(uid, remark=f"Luffy-{link['label']}-Server")]
+    for i, addr in enumerate(addresses): links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr))
+    return "\n".join(links_out)
 
-# ── Fix #1 + #2 + #4: /sub/{uid} endpoint ───────────────────────────────────
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
     import base64
-
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None:
-            raise HTTPException(status_code=404, detail="link not found")
-
-    if not link["active"]:
-        raise HTTPException(status_code=403, detail="link disabled")
-
-    # Fix #2: safe expiry check using timezone-aware comparison
+        if link is None: raise HTTPException(status_code=404, detail="link not found")
+    if not link["active"]: raise HTTPException(status_code=403, detail="link disabled")
     expires_at = parse_expires_at(link.get("expires_at"))
-    if expires_at is not None and expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=403, detail="link expired")
-
-    async with CUSTOM_ADDRESSES_LOCK:
-        addresses = list(CUSTOM_ADDRESSES)
-
-    # Feature #4: status pseudo-node + real links
+    if expires_at is not None and expires_at < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
+    async with CUSTOM_ADDRESSES_LOCK: addresses = list(CUSTOM_ADDRESSES)
     sub_content = generate_subscription_content(link, uid, addresses)
     encoded = base64.b64encode(sub_content.encode()).decode()
-
-    # Fix #1: send a huge number instead of 0 when unlimited, so clients don't block
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
-
-    # Fix #2: safe expire timestamp for header (seconds since epoch, 0 = no expiry)
     expire_ts = 0
-    if expires_at is not None:
-        expire_ts = int(expires_at.timestamp())
-
-    headers = {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Content-Disposition": 'attachment; filename="sub.txt"',
-        "profile-update-interval": "6",
-        "subscription-userinfo": (
-            f"upload={link['used_bytes']}; download=0; "
-            f"total={total_bytes}; expire={expire_ts}"
-        ),
-    }
+    if expires_at is not None: expire_ts = int(expires_at.timestamp())
+    headers = {"Content-Type": "text/plain; charset=utf-8", "Content-Disposition": 'attachment; filename="sub.txt"', "profile-update-interval": "6", "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={total_bytes}; expire={expire_ts}"}
     return Response(content=encoded, headers=headers)
-
 
 RELAY_BUF = 64 * 1024
 
-
 async def parse_vless_header(first_chunk: bytes):
-    if len(first_chunk) < 24:
-        raise ValueError("chunk too small")
-    pos = 0
-    pos += 1
-    pos += 16
-    addon_len = first_chunk[pos]
-    pos += 1
-    pos += addon_len
-    command = first_chunk[pos]
-    pos += 1
-    port = int.from_bytes(first_chunk[pos: pos + 2], "big")
-    pos += 2
-    addr_type = first_chunk[pos]
-    pos += 1
+    if len(first_chunk) < 24: raise ValueError("chunk too small")
+    pos = 1 + 16
+    addon_len = first_chunk[pos]; pos += 1 + addon_len
+    command = first_chunk[pos]; pos += 1
+    port = int.from_bytes(first_chunk[pos:pos+2], "big"); pos += 2
+    addr_type = first_chunk[pos]; pos += 1
     if addr_type == 1:
-        addr_bytes = first_chunk[pos: pos + 4]
-        pos += 4
+        addr_bytes = first_chunk[pos:pos+4]; pos += 4
         address = ".".join(str(b) for b in addr_bytes)
     elif addr_type == 2:
-        domain_len = first_chunk[pos]
-        pos += 1
-        address = first_chunk[pos: pos + domain_len].decode("utf-8", errors="ignore")
-        pos += domain_len
+        domain_len = first_chunk[pos]; pos += 1
+        address = first_chunk[pos:pos+domain_len].decode("utf-8", errors="ignore"); pos += domain_len
     elif addr_type == 3:
-        addr_bytes = first_chunk[pos: pos + 16]
-        pos += 16
-        address = ":".join(
-            f"{addr_bytes[i]:02x}{addr_bytes[i + 1]:02x}" for i in range(0, 16, 2)
-        )
-    else:
-        raise ValueError(f"unknown address type: {addr_type}")
+        addr_bytes = first_chunk[pos:pos+16]; pos += 16
+        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
+    else: raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-
-# ── Fix #2: check_quota uses timezone-aware expiry comparison ────────────────
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None:
-            return False
-        if not link["active"]:
-            return False
-        # Fix #2: safe expiry comparison
+        if link is None or not link["active"]: return False
         expires_at = parse_expires_at(link.get("expires_at"))
-        if expires_at is not None and expires_at < datetime.now(timezone.utc):
-            return False
-        if link["limit_bytes"] == 0:
-            return True
+        if expires_at is not None and expires_at < datetime.now(timezone.utc): return False
+        if link["limit_bytes"] == 0: return True
         return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
-
 
 async def add_usage(uid: str, n: int):
     async with LINKS_LOCK:
-        if uid in LINKS:
-            LINKS[uid]["used_bytes"] += n
+        if uid in LINKS: LINKS[uid]["used_bytes"] += n
 
-
-async def ws_to_tcp(
-    websocket: WebSocket,
-    writer: asyncio.StreamWriter,
-    conn_id: str,
-    link_uid: str,
-):
+async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
         while True:
             msg = await websocket.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
+            if msg["type"] == "websocket.disconnect": break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data:
-                continue
+            if not data: continue
             size = len(data)
-            if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded")
-                break
-            stats["total_bytes"] += size
-            stats["total_requests"] += 1
+            if not await check_quota(link_uid, size): await websocket.close(code=1008, reason="quota exceeded"); break
+            stats["total_bytes"] += size; stats["total_requests"] += 1
             connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
             daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-            await add_usage(link_uid, size)
-            writer.write(data)
-            await writer.drain()
-    except WebSocketDisconnect:
-        pass
+            await add_usage(link_uid, size); writer.write(data); await writer.drain()
+    except WebSocketDisconnect: pass
     finally:
-        try:
-            writer.write_eof()
-        except Exception:
-            pass
+        try: writer.write_eof()
+        except Exception: pass
 
-
-async def tcp_to_ws(
-    websocket: WebSocket,
-    reader: asyncio.StreamReader,
-    conn_id: str,
-    link_uid: str,
-):
+async def tcp_to_ws(websocket, reader, conn_id, link_uid):
     first = True
     try:
         while True:
             data = await reader.read(RELAY_BUF)
-            if not data:
-                break
+            if not data: break
             size = len(data)
-            if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded")
-                break
-            stats["total_bytes"] += size
-            connections[conn_id]["bytes"] += size
+            if not await check_quota(link_uid, size): await websocket.close(code=1008, reason="quota exceeded"); break
+            stats["total_bytes"] += size; connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
             daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
             await add_usage(link_uid, size)
-            await websocket.send_bytes((b"\x00\x00" + data) if first else data)
-            first = False
-    except Exception:
-        pass
-
+            await websocket.send_bytes((b"\x00\x00" + data) if first else data); first = False
+    except Exception: pass
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
-    await ensure_default_link()
-    await websocket.accept()
-    writer = None
-    conn_id = None
-    client_ip = get_client_ip(websocket)
+    await ensure_default_link(); await websocket.accept()
+    writer = None; conn_id = None; client_ip = get_client_ip(websocket)
     try:
         async with LINKS_LOCK:
             link_data = LINKS.get(uuid)
             if link_data is None or not link_data["active"]:
-                await websocket.close(code=1008, reason="link not found or disabled")
-                return
+                await websocket.close(code=1008, reason="link not found or disabled"); return
             max_conn = link_data.get("max_connections", 0)
-
-        # Fix #2: expiry check at connection time
         expires_at = parse_expires_at(link_data.get("expires_at"))
         if expires_at is not None and expires_at < datetime.now(timezone.utc):
-            await websocket.close(code=1008, reason="link expired")
-            return
-
+            await websocket.close(code=1008, reason="link expired"); return
         if max_conn > 0:
             already_connected = client_ip in link_ip_map.get(uuid, set())
             if not already_connected:
                 current = count_connections_for_link(uuid)
-                if current >= max_conn:
-                    await websocket.close(code=1008, reason="connection limit reached")
-                    return
-
+                if current >= max_conn: await websocket.close(code=1008, reason="connection limit reached"); return
         first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect":
-            return
+        if first_msg["type"] == "websocket.disconnect": return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk:
-            return
-
+        if not first_chunk: return
         command, address, port, initial_payload = await parse_vless_header(first_chunk)
         conn_id = secrets.token_urlsafe(8)
-        connections[conn_id] = {
-            "uuid": uuid,
-            "ip": client_ip,
-            "connected_at": datetime.now(timezone.utc).isoformat(),
-            "bytes": 0,
-        }
-        connection_sockets[conn_id] = websocket
-        link_ip_map[uuid].add(client_ip)
-
-        size = len(first_chunk)
-        stats["total_bytes"] += size
-        stats["total_requests"] += 1
+        connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now(timezone.utc).isoformat(), "bytes": 0}
+        connection_sockets[conn_id] = websocket; link_ip_map[uuid].add(client_ip)
+        size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
         connections[conn_id]["bytes"] += size
         hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
         daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
         await add_usage(uuid, size)
-
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=10.0
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         if initial_payload:
-            p_size = len(initial_payload)
-            stats["total_bytes"] += p_size
-            connections[conn_id]["bytes"] += p_size
+            p_size = len(initial_payload); stats["total_bytes"] += p_size; connections[conn_id]["bytes"] += p_size
             hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += p_size
             daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += p_size
-            await add_usage(uuid, p_size)
-            writer.write(initial_payload)
-            await writer.drain()
-
+            await add_usage(uuid, p_size); writer.write(initial_payload); await writer.drain()
         task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
         task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
-        done, pending = await asyncio.wait(
-            {task_up, task_down}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-
-    except WebSocketDisconnect:
-        pass
+        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending: t.cancel()
+    except WebSocketDisconnect: pass
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now(timezone.utc).isoformat()})
     finally:
         if writer:
-            try:
-                writer.close()
-            except Exception:
-                pass
+            try: writer.close()
+            except Exception: pass
         if conn_id:
-            info = connections.pop(conn_id, None)
-            connection_sockets.pop(conn_id, None)
+            info = connections.pop(conn_id, None); connection_sockets.pop(conn_id, None)
             if info:
-                uid = info.get("uuid")
-                ip = info.get("ip")
+                uid = info.get("uuid"); ip = info.get("ip")
                 if uid and ip:
-                    has_other = any(
-                        c.get("uuid") == uid and c.get("ip") == ip
-                        for c in connections.values()
-                    )
-                    if not has_other:
-                        remove_ip_from_link(uid, ip)
+                    has_other = any(c.get("uuid") == uid and c.get("ip") == ip for c in connections.values())
+                    if not has_other: remove_ip_from_link(uid, ip)
 
 
 LOGIN_HTML = r"""<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Luffy Panel</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html[data-theme="dark"]{--bg:#050508;--surface:rgba(20,20,20,0.85);--surface2:#1c1c1c;--border:rgba(255,255,255,0.06);--text:rgba(255,255,255,0.92);--text2:rgba(255,255,255,0.5);--text3:rgba(255,255,255,0.25);--primary:#dc2626;--primary-glow:rgba(220,38,38,0.15);--accent:#991b1b;--error:#ef4444;--error-bg:rgba(239,68,68,0.08);--orb1:rgba(220,38,38,0.12);--orb2:rgba(153,27,27,0.1);--orb3:rgba(239,68,68,0.06)}
-html[data-theme="light"]{--bg:#f8f9fa;--surface:rgba(255,255,255,0.9);--surface2:#f9fafb;--border:rgba(0,0,0,0.06);--text:rgba(0,0,0,0.88);--text2:rgba(0,0,0,0.5);--text3:rgba(0,0,0,0.25);--primary:#16a34a;--primary-glow:rgba(22,163,74,0.12);--accent:#15803d;--error:#dc2626;--error-bg:rgba(220,38,38,0.06);--orb1:rgba(22,163,74,0.1);--orb2:rgba(21,128,61,0.08);--orb3:rgba(34,197,94,0.05)}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);transition:background .5s,color .5s;overflow:hidden}
-
-.bg-canvas{position:fixed;inset:0;z-index:0;pointer-events:none}
-.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:0;animation:orbFloat 20s ease-in-out infinite}
-.orb-1{width:400px;height:400px;background:var(--orb1);top:-10%;left:-5%;animation-delay:0s}
-.orb-2{width:350px;height:350px;background:var(--orb2);bottom:-10%;right:-5%;animation-delay:-7s}
-.orb-3{width:250px;height:250px;background:var(--orb3);top:40%;left:60%;animation-delay:-14s}
-@keyframes orbFloat{0%,100%{transform:translate(0,0) scale(1);opacity:0.6}25%{transform:translate(60px,-40px) scale(1.1);opacity:0.8}50%{transform:translate(-30px,50px) scale(0.9);opacity:0.5}75%{transform:translate(40px,20px) scale(1.05);opacity:0.7}}
-
-.grid-bg{position:fixed;inset:0;z-index:0;opacity:0.03;background-image:linear-gradient(rgba(255,255,255,0.1) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.1) 1px,transparent 1px);background-size:60px 60px;pointer-events:none}
-
-.toolbar{position:fixed;top:20px;right:20px;display:flex;gap:6px;z-index:10}
-.toolbar button{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text2);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:15px;transition:all .3s;backdrop-filter:blur(20px)}
-.toolbar button:hover{border-color:var(--primary);color:var(--primary);transform:scale(1.05)}
-
-.login-page{width:100%;max-width:380px;padding:0 20px;position:relative;z-index:1}
-.login-card{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:48px 36px 36px;position:relative;overflow:hidden;backdrop-filter:blur(40px);box-shadow:0 8px 40px rgba(0,0,0,0.15),0 0 80px rgba(220,38,38,0.05);animation:cardIn .8s cubic-bezier(0.16,1,0.3,1) forwards;opacity:0;transform:translateY(30px) scale(0.96)}
-@keyframes cardIn{to{opacity:1;transform:translateY(0) scale(1)}}
-.login-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--primary),transparent);animation:shimmer 3s ease-in-out infinite}
-@keyframes shimmer{0%,100%{opacity:0.5;transform:scaleX(0.5)}50%{opacity:1;transform:scaleX(1)}}
-.login-card::after{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at var(--mx,50%) var(--my,50%),rgba(220,38,38,0.04) 0%,transparent 50%);pointer-events:none;transition:opacity .3s;opacity:0}
-.login-card:hover::after{opacity:1}
-
-.brand{text-align:center;margin-bottom:36px}
-.brand svg{margin-bottom:20px;filter:drop-shadow(0 0 20px rgba(220,38,38,0.3));animation:logoPulse 4s ease-in-out infinite}
-@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 20px rgba(220,38,38,0.3));transform:scale(1)}50%{filter:drop-shadow(0 0 30px rgba(220,38,38,0.5));transform:scale(1.02)}}
-.brand h1{font-size:22px;font-weight:800;color:var(--text);letter-spacing:-0.03em;animation:fadeUp .6s .2s ease both}
-.brand p{font-size:11px;color:var(--text3);margin-top:6px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;animation:fadeUp .6s .3s ease both}
-@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-
-.form-group{margin-bottom:20px;animation:fadeUp .6s .4s ease both}
-.form-group label{display:block;font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.06em}
-.form-group input{width:100%;padding:13px 16px;background:var(--surface2);border:1.5px solid var(--border);border-radius:12px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .3s cubic-bezier(0.4,0,0.2,1)}
-.form-group input:focus{border-color:var(--primary);box-shadow:0 0 0 4px var(--primary-glow),0 0 20px var(--primary-glow)}
-.form-group input::placeholder{color:var(--text3)}
-
-.login-btn{width:100%;padding:13px;background:var(--primary);border:none;border-radius:12px;color:#fff;font-size:14px;font-weight:700;font-family:inherit;cursor:pointer;transition:all .3s cubic-bezier(0.4,0,0.2,1);letter-spacing:0.02em;position:relative;overflow:hidden;animation:fadeUp .6s .5s ease both}
-.login-btn::before{content:'';position:absolute;top:50%;left:50%;width:0;height:0;background:rgba(255,255,255,0.2);border-radius:50%;transform:translate(-50%,-50%);transition:width .5s,height .5s}
-.login-btn:hover{filter:brightness(1.15);transform:translateY(-2px);box-shadow:0 8px 25px rgba(220,38,38,0.35)}
-.login-btn:hover::before{width:300px;height:300px}
-.login-btn:active{transform:translateY(0) scale(0.98)}
-.login-btn:active::before{width:0;height:0;transition:width .1s,height .1s}
-
-.error-msg{background:var(--error-bg);border:1px solid rgba(255,77,106,0.15);color:var(--error);padding:10px 14px;border-radius:10px;font-size:13px;display:none;margin-bottom:20px;text-align:center;font-weight:500;animation:shake .4s ease}
-.error-msg.show{display:block}
-@keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
-
-.particles{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
-.particle{position:absolute;width:2px;height:2px;background:var(--primary);border-radius:50%;opacity:0;animation:particleFall linear infinite}
-@keyframes particleFall{0%{opacity:0;transform:translateY(-10px) scale(0)}10%{opacity:0.6;transform:translateY(0) scale(1)}90%{opacity:0.3;transform:translateY(calc(100vh - 20px)) scale(0.5)}100%{opacity:0;transform:translateY(100vh) scale(0)}}
+:root{--gold:#FFD700;--gold2:#FFC200;--gold3:#B8860B;--black:#060608;--surface:rgba(12,12,16,0.97);--border:rgba(255,215,0,0.18);--text:rgba(255,255,255,0.93);--text2:rgba(255,215,0,0.75);--text3:rgba(255,255,255,0.28)}
+body{font-family:'Inter',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--black);color:var(--text);overflow:hidden;position:relative}
+.bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(255,215,0,0.07),transparent 60%),radial-gradient(ellipse 60% 40% at 80% 80%,rgba(255,255,255,0.03),transparent 50%)}
+.grid{position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(255,215,0,0.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,215,0,0.035) 1px,transparent 1px);background-size:52px 52px}
+.card{position:relative;z-index:2;width:370px;padding:44px 36px 36px;background:var(--surface);border:1px solid var(--border);border-radius:22px;backdrop-filter:blur(48px);box-shadow:0 0 0 1px rgba(255,215,0,0.06),0 0 60px rgba(255,215,0,0.06),0 48px 96px rgba(0,0,0,0.7);animation:up .8s cubic-bezier(.16,1,.3,1) both}
+@keyframes up{from{opacity:0;transform:translateY(36px) scale(.95)}to{opacity:1;transform:none}}
+.card::before{content:'';position:absolute;top:0;left:20%;right:20%;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.6),transparent)}
+.corner{position:absolute;width:14px;height:14px;border-color:rgba(255,215,0,0.4);border-style:solid}
+.c-tl{top:10px;left:10px;border-width:1.5px 0 0 1.5px;border-radius:3px 0 0 0}
+.c-tr{top:10px;right:10px;border-width:1.5px 1.5px 0 0;border-radius:0 3px 0 0}
+.c-bl{bottom:10px;left:10px;border-width:0 0 1.5px 1.5px;border-radius:0 0 0 3px}
+.c-br{bottom:10px;right:10px;border-width:0 1.5px 1.5px 0;border-radius:0 0 3px 0}
+.brand{text-align:center;margin-bottom:32px}
+.hat{filter:drop-shadow(0 0 18px rgba(255,215,0,.65)) drop-shadow(0 0 40px rgba(255,215,0,.25));animation:hf 4s ease-in-out infinite;display:inline-block}
+@keyframes hf{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-9px) rotate(2deg)}}
+.brand-name{font-family:'Cinzel',serif;font-size:24px;font-weight:900;letter-spacing:.12em;background:linear-gradient(135deg,#FFD700 0%,#FFFACD 40%,#FFD700 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-top:12px;filter:drop-shadow(0 0 8px rgba(255,215,0,.4))}
+.brand-sub{font-size:9.5px;color:var(--text3);letter-spacing:.22em;text-transform:uppercase;margin-top:5px}
+.lbl{display:block;font-size:9.5px;font-weight:700;color:var(--text2);letter-spacing:.16em;text-transform:uppercase;margin-bottom:7px}
+.inp{width:100%;padding:11px 15px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,215,0,0.18);border-radius:10px;color:var(--text);font-size:13.5px;font-family:inherit;outline:none;transition:all .25s;margin-bottom:16px}
+.inp:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(255,215,0,.1),0 0 20px rgba(255,215,0,.15)}
+.inp::placeholder{color:rgba(255,255,255,.18)}
+.btn{width:100%;padding:12px;background:linear-gradient(135deg,#FFD700 0%,#C8940A 100%);border:none;border-radius:10px;color:#000;font-size:13.5px;font-weight:800;font-family:'Cinzel',serif;letter-spacing:.1em;cursor:pointer;transition:all .28s;box-shadow:0 0 24px rgba(255,215,0,.35),0 4px 16px rgba(0,0,0,.4);position:relative;overflow:hidden}
+.btn::after{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,.25),transparent);opacity:0;transition:opacity .25s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 0 40px rgba(255,215,0,.55),0 8px 24px rgba(0,0,0,.5)}
+.btn:hover::after{opacity:1}
+.btn:active{transform:translateY(0) scale(.98)}
+.err{background:rgba(255,60,60,.07);border:1px solid rgba(255,60,60,.2);color:#ff7070;padding:9px 13px;border-radius:8px;font-size:12px;display:none;margin-bottom:14px;text-align:center;animation:shake .35s ease}
+.err.show{display:block}
+@keyframes shake{0%,100%{transform:translateX(0)}25%,75%{transform:translateX(-5px)}50%{transform:translateX(5px)}}
 </style>
 </head>
 <body>
-<div class="bg-canvas">
-  <div class="orb orb-1"></div>
-  <div class="orb orb-2"></div>
-  <div class="orb orb-3"></div>
-</div>
-<div class="grid-bg"></div>
-<div class="particles" id="particles"></div>
-
-<div class="toolbar">
-  <button id="lang-toggle" onclick="cycleLang()" title="Language">EN</button>
-  <button id="theme-toggle" onclick="toggleTheme()" title="Theme">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-  </button>
-</div>
-<div class="login-page">
-  <div class="login-card" id="login-card">
-    <div class="brand">
-      <svg width="60" height="60" viewBox="0 0 56 56" fill="none">
-        <rect width="56" height="56" rx="14" fill="url(#logo-grad)"/>
-        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3">
-          <animateTransform attributeName="transform" type="rotate" from="0 28 28" to="360 28 28" dur="20s" repeatCount="indefinite"/>
-        </circle>
-        <circle cx="28" cy="18" r="3.5" fill="#fff">
-          <animate attributeName="r" values="3.5;4;3.5" dur="3s" repeatCount="indefinite"/>
-        </circle>
-        <circle cx="19" cy="33" r="3.5" fill="#fff">
-          <animate attributeName="r" values="3.5;4;3.5" dur="3s" begin="1s" repeatCount="indefinite"/>
-        </circle>
-        <circle cx="37" cy="33" r="3.5" fill="#fff">
-          <animate attributeName="r" values="3.5;4;3.5" dur="3s" begin="2s" repeatCount="indefinite"/>
-        </circle>
-        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8">
-          <animate attributeName="opacity" values="0.8;0.4;0.8" dur="2s" repeatCount="indefinite"/>
-        </line>
-        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8">
-          <animate attributeName="opacity" values="0.8;0.4;0.8" dur="2s" begin="0.5s" repeatCount="indefinite"/>
-        </line>
-        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8">
-          <animate attributeName="opacity" values="0.8;0.4;0.8" dur="2s" begin="1s" repeatCount="indefinite"/>
-        </line>
-        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9">
-          <animate attributeName="r" values="2;2.5;2" dur="2s" repeatCount="indefinite"/>
-          <animate attributeName="opacity" values="0.9;0.6;0.9" dur="2s" repeatCount="indefinite"/>
-        </circle>
-        <defs><linearGradient id="logo-grad" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#dc2626"/><stop offset="1" stop-color="#991b1b"/></linearGradient></defs>
+<div class="bg"></div><div class="grid"></div>
+<div class="card">
+  <div class="corner c-tl"></div><div class="corner c-tr"></div>
+  <div class="corner c-bl"></div><div class="corner c-br"></div>
+  <div class="brand">
+    <div class="hat">
+      <svg width="84" height="68" viewBox="0 0 84 68" fill="none">
+        <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
+        <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
+        <ellipse cx="42" cy="52" rx="32" ry="8" fill="none" stroke="#B8860B" stroke-width=".8" opacity=".45"/>
+        <ellipse cx="42" cy="52" rx="23" ry="5.5" fill="none" stroke="#B8860B" stroke-width=".7" opacity=".35"/>
+        <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
+        <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
+        <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
+        <line x1="31" y1="21" x2="29" y2="48" stroke="#B8860B" stroke-width=".6" opacity=".35"/>
+        <line x1="42" y1="18" x2="42" y2="49" stroke="#B8860B" stroke-width=".6" opacity=".35"/>
+        <line x1="53" y1="21" x2="55" y2="48" stroke="#B8860B" stroke-width=".6" opacity=".35"/>
+        <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
+        <ellipse cx="42" cy="62" rx="36" ry="5" fill="rgba(255,215,0,.06)" filter="url(#blur)"/>
+        <defs><filter id="blur"><feGaussianBlur stdDeviation="3"/></filter></defs>
       </svg>
-      <h1>Luffy Panel</h1>
-      <p>v1.0</p>
     </div>
-    <div class="error-msg" id="err-box"></div>
-    <form id="login-form">
-      <div class="form-group">
-        <label data-en="Password" data-fa="رمز عبور">Password</label>
-        <input type="password" id="password" placeholder="Enter password" autofocus>
-      </div>
-      <button type="submit" class="login-btn" data-en="Sign In" data-fa="ورود">Sign In</button>
-    </form>
+    <div class="brand-name">LUFFY PANEL</div>
+    <div class="brand-sub">v1.0 · Proxy Gateway</div>
   </div>
+  <div class="err" id="err"></div>
+  <form id="frm">
+    <label class="lbl">Password</label>
+    <input class="inp" type="password" id="pw" placeholder="Enter your password" autofocus>
+    <button type="submit" class="btn">SIGN IN</button>
+  </form>
 </div>
 <script>
-let lang=localStorage.getItem('ren_lang')||'en';
-let theme=localStorage.getItem('ren_theme')||'dark';
-function setLang(l){lang=l;document.body.dir=l==='fa'?'rtl':'ltr';document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v});document.getElementById('lang-toggle').textContent=l.toUpperCase();localStorage.setItem('ren_lang',l)}
-function cycleLang(){setLang(lang==='en'?'fa':'en')}
-function applyTheme(t){theme=t;document.documentElement.setAttribute('data-theme',t);localStorage.setItem('ren_theme',t)}
-function toggleTheme(){applyTheme(theme==='dark'?'light':'dark')}
-applyTheme(theme);setLang(lang);
-
-const card=document.getElementById('login-card');
-card.addEventListener('mousemove',e=>{const r=card.getBoundingClientRect();card.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');card.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%')});
-
-const pc=document.getElementById('particles');
-for(let i=0;i<20;i++){const p=document.createElement('div');p.className='particle';p.style.left=Math.random()*100+'%';p.style.animationDuration=(8+Math.random()*12)+'s';p.style.animationDelay=Math.random()*10+'s';p.style.width=p.style.height=(1+Math.random()*2)+'px';pc.appendChild(p)}
-
-document.getElementById('login-form').addEventListener('submit',async e=>{
-  e.preventDefault();const err=document.getElementById('err-box');err.classList.remove('show');
+document.getElementById('frm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const err=document.getElementById('err');err.classList.remove('show');
   try{
-    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
     if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Failed');}
     location.href='/dashboard';
   }catch(e){err.textContent=e.message;err.classList.add('show')}
@@ -1017,828 +584,668 @@ document.getElementById('login-form').addEventListener('submit',async e=>{
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Luffy Panel</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html[data-theme="dark"]{--bg:#0a0a0a;--surface:#141414;--surface2:#1c1c1c;--surface3:#2a2a2a;--border:rgba(255,255,255,0.06);--border2:rgba(255,255,255,0.1);--text:rgba(255,255,255,0.92);--text2:rgba(255,255,255,0.5);--text3:rgba(255,255,255,0.25);--primary:#dc2626;--primary-glow:rgba(220,38,38,0.15);--primary-dim:rgba(220,38,38,0.1);--accent:#991b1b;--green:#22c55e;--green-dim:rgba(34,197,94,0.1);--red:#ef4444;--red-dim:rgba(239,68,68,0.08);--yellow:#fbbf24;--sidebar-bg:#0f0f0f;--shadow:0 1px 3px rgba(0,0,0,0.4)}
-html[data-theme="light"]{--bg:#ffffff;--surface:#ffffff;--surface2:#f9fafb;--surface3:#f3f4f6;--border:rgba(0,0,0,0.06);--border2:rgba(0,0,0,0.1);--text:rgba(0,0,0,0.88);--text2:rgba(0,0,0,0.5);--text3:rgba(0,0,0,0.25);--primary:#16a34a;--primary-glow:rgba(22,163,74,0.1);--primary-dim:rgba(22,163,74,0.06);--accent:#15803d;--green:#16a34a;--green-dim:rgba(22,163,74,0.06);--red:#dc2626;--red-dim:rgba(220,38,38,0.06);--yellow:#d97706;--sidebar-bg:#ffffff;--shadow:0 1px 3px rgba(0,0,0,0.06)}
-html,body{height:100%}
-body{font-family:'Inter','Vazirmatn',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;transition:background .3s,color .3s}
+:root{
+  --gold:#FFD700;--gold2:#FFC200;--gold3:#C8900A;--gold-dim:rgba(255,215,0,0.12);
+  --black:#060608;--black2:#0c0c10;--black3:#111118;
+  --surface:rgba(12,12,18,0.97);--surface2:rgba(20,20,28,0.9);--surface3:rgba(28,28,40,0.8);
+  --border:rgba(255,215,0,0.1);--border2:rgba(255,215,0,0.2);
+  --text:rgba(255,255,255,0.92);--text2:rgba(255,215,0,0.7);--text3:rgba(255,255,255,0.28);
+  --white-neon:rgba(255,255,255,0.85);--white-glow:0 0 16px rgba(255,255,255,0.25);
+  --gold-glow:0 0 20px rgba(255,215,0,0.4);
+  --green:#4ade80;--green-dim:rgba(74,222,128,0.1);
+  --red:#f87171;--red-dim:rgba(248,113,113,0.1);
+  --yellow:#fbbf24;
+  --nav-w:64px;
+  --sidebar-full:220px;
+}
+html,body{height:100%;background:var(--black)}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh}
 body[dir="rtl"]{direction:rtl;text-align:right}
-::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:3px}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,215,0,0.2);border-radius:4px}
 
-.sidebar{width:220px;background:var(--sidebar-bg);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;left:0;top:0;bottom:0;z-index:100;transition:background .3s}
-.sidebar-brand{padding:16px 16px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);position:relative;overflow:hidden}
-.sidebar-brand::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--primary),transparent);animation:shimmer 4s ease-in-out infinite}
-@keyframes shimmer{0%,100%{opacity:0.3;transform:scaleX(0.3)}50%{opacity:0.8;transform:scaleX(1)}}
-.sidebar-brand-left{display:flex;align-items:center;gap:10px}
-.sidebar-brand-left .brand-name{font-size:15px;font-weight:700;color:var(--text);letter-spacing:-0.02em}
-.sidebar-brand-right{display:flex;gap:4px}
-.sidebar-brand-right button{width:28px;height:28px;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--text3);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:12px;transition:all .2s}
-.sidebar-brand-right button:hover{border-color:var(--primary);color:var(--primary)}
-.sidebar-nav{flex:1;padding:8px;overflow-y:auto}
-.nav-section{font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;padding:14px 12px 6px}
-.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;margin:1px 0;border-radius:8px;color:var(--text2);font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;text-decoration:none;border:none;background:none;width:100%;text-align:left}
-.nav-item:hover{background:var(--primary-dim);color:var(--text)}
-.nav-item.active{background:var(--primary-dim);color:var(--primary);font-weight:600;box-shadow:inset 3px 0 0 var(--primary)}
-.nav-icon{width:18px;height:18px;flex-shrink:0;opacity:0.7}
-.nav-item.active .nav-icon{opacity:1}
-.nav-badge{margin-left:auto;background:var(--surface3);color:var(--text3);font-size:10px;padding:2px 7px;border-radius:8px;font-weight:600}
-.sidebar-footer{padding:12px;border-top:1px solid var(--border)}
-.sidebar-footer .footer-row{display:flex;gap:4px;margin-bottom:8px}
-.sidebar-footer .footer-btn{flex:1;padding:6px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--text3);font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;text-align:center}
-.sidebar-footer .footer-btn.active{background:var(--primary);color:#fff;border-color:var(--primary)}
-.sidebar-footer .footer-btn:hover:not(.active){border-color:var(--border2);color:var(--text2)}
-.sidebar-footer .logout-btn{width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;background:none;color:var(--text3);font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
-.sidebar-footer .logout-btn:hover{background:var(--red-dim);border-color:rgba(255,77,106,0.2);color:var(--red)}
-.sidebar-footer .version{text-align:center;font-size:10px;color:var(--text3);margin-top:8px;letter-spacing:0.02em}
+/* ── Global BG ── */
+.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,rgba(255,215,0,0.05),transparent 60%)}
+.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(255,215,0,0.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,215,0,0.025) 1px,transparent 1px);background-size:56px 56px}
 
-.main{margin-left:220px;flex:1;padding:24px 28px 48px;min-height:100vh}
-.page{display:none;animation:pageIn .4s ease}
+/* ════════════════════════════════════════════════
+   SIDEBAR — icon-only, nav at BOTTOM
+════════════════════════════════════════════════ */
+.sidebar{
+  position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);
+  background:rgba(8,8,12,0.98);
+  border-right:1px solid var(--border);
+  display:flex;flex-direction:column;
+  z-index:100;transition:width .3s cubic-bezier(.4,0,.2,1);
+  backdrop-filter:blur(20px);
+}
+.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,rgba(255,215,0,0.3) 30%,rgba(255,215,0,0.3) 70%,transparent)}
+
+/* brand at top */
+.sb-brand{padding:16px 0;display:flex;flex-direction:column;align-items:center;gap:2px;border-bottom:1px solid var(--border);flex-shrink:0}
+.sb-hat{filter:drop-shadow(0 0 10px rgba(255,215,0,.6));transition:filter .3s}
+.sb-hat:hover{filter:drop-shadow(0 0 18px rgba(255,215,0,.9))}
+.sb-title{font-family:'Cinzel',serif;font-size:8px;letter-spacing:.18em;color:rgba(255,215,0,.6);text-transform:uppercase;white-space:nowrap;overflow:hidden}
+
+/* nav items at BOTTOM */
+.sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:12px;gap:2px;padding-left:8px;padding-right:8px}
+
+.nav-item{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:3px;padding:10px 6px;border-radius:12px;
+  color:var(--text3);cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);
+  border:1px solid transparent;position:relative;overflow:hidden;
+  text-decoration:none;background:none;width:100%;font-family:inherit;
+}
+.nav-item::before{content:'';position:absolute;inset:0;border-radius:12px;background:linear-gradient(135deg,rgba(255,215,0,0.08),transparent);opacity:0;transition:opacity .2s}
+.nav-item:hover{color:rgba(255,215,0,.8);border-color:rgba(255,215,0,.12)}
+.nav-item:hover::before{opacity:1}
+.nav-item.active{color:var(--gold);border-color:rgba(255,215,0,.22);background:rgba(255,215,0,.07);box-shadow:0 0 16px rgba(255,215,0,.1),inset 0 1px 0 rgba(255,215,0,.12)}
+.nav-item.active::before{opacity:1}
+.nav-icon{width:18px;height:18px;flex-shrink:0;transition:transform .2s}
+.nav-item:hover .nav-icon,.nav-item.active .nav-icon{transform:scale(1.1)}
+.nav-label{font-size:8.5px;font-weight:600;letter-spacing:.05em;white-space:nowrap;overflow:hidden}
+.nav-badge{position:absolute;top:5px;right:5px;background:var(--gold);color:#000;font-size:8px;font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;justify-content:center;padding:0 3px}
+
+/* bottom bar: lang + logout */
+.sb-bottom{padding:8px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;flex-shrink:0}
+.lang-row{display:flex;gap:4px}
+.lang-btn{flex:1;padding:5px 2px;border:1px solid var(--border);border-radius:7px;background:none;color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;letter-spacing:.05em}
+.lang-btn.active{background:var(--gold-dim);border-color:rgba(255,215,0,.3);color:var(--gold)}
+.lang-btn:hover:not(.active){border-color:rgba(255,215,0,.15);color:rgba(255,215,0,.5)}
+.logout-btn{display:flex;align-items:center;justify-content:center;padding:7px;border:1px solid rgba(248,113,113,.15);border-radius:8px;background:rgba(248,113,113,.06);color:rgba(248,113,113,.6);cursor:pointer;transition:all .2s;font-size:10px;gap:4px;font-weight:600;font-family:inherit}
+.logout-btn:hover{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3);color:var(--red)}
+
+/* ── Main ── */
+.main{margin-left:var(--nav-w);flex:1;padding:24px 28px 48px;min-height:100vh;position:relative;z-index:1}
+.page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
-@keyframes pageIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between}
-.page-title{font-size:18px;font-weight:700;color:var(--text);letter-spacing:-0.01em}
-.page-sub{font-size:12px;color:var(--text3);margin-top:3px}
+@keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;transition:all .3s cubic-bezier(0.4,0,0.2,1);animation:cardIn .5s ease both}
-.stat-card:nth-child(1){animation-delay:.1s}.stat-card:nth-child(2){animation-delay:.2s}.stat-card:nth-child(3){animation-delay:.3s}.stat-card:nth-child(4){animation-delay:.4s}
-@keyframes cardIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-.stat-card:hover{box-shadow:var(--shadow);transform:translateY(-2px)}
-.stat-label{font-size:11px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px}
-.stat-value{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.02em}
-.stat-unit{font-size:12px;font-weight:400;color:var(--text3)}
+.page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.page-title{font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--text);letter-spacing:.04em}
+.page-sub{font-size:11px;color:var(--text3);margin-top:3px;letter-spacing:.02em}
 
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px;transition:all .3s cubic-bezier(0.4,0,0.2,1);animation:cardIn .5s ease both}
-.card:nth-child(1){animation-delay:.2s}.card:nth-child(2){animation-delay:.3s}
-.card:hover{box-shadow:var(--shadow);transform:translateY(-1px)}
-.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.card-title{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;color:var(--text)}
+/* ── Stat cards ── */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.4),transparent)}
+.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 4px 20px rgba(0,0,0,.4),0 0 20px rgba(255,215,0,.06)}
+@keyframes cIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.stat-label{font-size:9.5px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.stat-val{font-size:20px;font-weight:700;color:var(--text);letter-spacing:-.02em}
+.stat-unit{font-size:11px;font-weight:400;color:var(--text3)}
 
-.btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all .15s}
-.btn-primary{background:var(--primary);color:#fff}
-.btn-primary:hover{filter:brightness(1.1)}
-.btn-secondary{background:var(--surface3);color:var(--text2);border:1px solid var(--border);position:relative;overflow:hidden}
-.btn-secondary:hover{border-color:var(--primary);color:var(--primary);transform:translateY(-1px);box-shadow:0 2px 8px var(--primary-glow)}
-.btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,77,106,0.12)}
-.btn-danger:hover{background:rgba(255,77,106,0.15)}
-.btn-sm{padding:5px 10px;font-size:11px}
+/* ── Cards ── */
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:10px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.25),transparent)}
+.card:hover{border-color:rgba(255,215,0,.15);box-shadow:0 4px 20px rgba(0,0,0,.3)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card-title{font-size:12px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
 
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+/* ── Buttons ── */
+.btn{font-family:inherit;font-size:11.5px;font-weight:700;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .2s;letter-spacing:.03em}
+.btn-gold{background:linear-gradient(135deg,#FFD700,#C8900A);color:#000;box-shadow:0 0 16px rgba(255,215,0,.25)}
+.btn-gold:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 0 24px rgba(255,215,0,.4)}
+.btn-ghost{background:var(--surface3);color:var(--text3);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--gold);transform:translateY(-1px)}
+.btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.15)}
+.btn-danger:hover{background:rgba(248,113,113,.18)}
+.btn-sm{padding:4px 9px;font-size:10.5px}
+.btn-xs{padding:3px 8px;font-size:10px}
 
-.table-wrap{overflow-x:auto}
-.table{width:100%;border-collapse:collapse}
-.table th{text-align:left;font-size:11px;font-weight:600;color:var(--text3);padding:10px 12px;text-transform:uppercase;letter-spacing:0.04em;border-bottom:1px solid var(--border);background:var(--surface2)}
-.table td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
-.table tr:last-child td{border-bottom:none}
-.table tbody tr:hover td{background:var(--primary-dim)}
+/* ── Table ── */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tbl-wrap{overflow-x:auto}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{text-align:left;font-size:9.5px;font-weight:700;color:var(--text3);padding:9px 11px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:rgba(255,215,0,.025)}
+.tbl td{padding:9px 11px;border-bottom:1px solid rgba(255,255,255,.04);font-size:12.5px;vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tbody tr{transition:background .15s}
+.tbl tbody tr:hover td{background:rgba(255,215,0,.04)}
 
-.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:5px;font-size:10px;font-weight:700;letter-spacing:0.03em;text-transform:uppercase}
-.tag-vless{background:var(--primary-dim);color:var(--primary)}
-.tag-active{background:var(--green-dim);color:var(--green)}
-.tag-disabled{background:var(--red-dim);color:var(--red)}
+/* ── Tags ── */
+.tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
+.tag-vless{background:rgba(255,215,0,.1);color:var(--gold);border:1px solid rgba(255,215,0,.2)}
+.tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.2)}
+.tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 
-.usage-pill{display:flex;align-items:center;gap:8px;padding:3px 10px;border-radius:999px;background:var(--surface3);font-size:11px;color:var(--text2)}
-.usage-pill .used{color:var(--text);font-weight:600}
-.usage-pill .bar{flex:1;height:4px;background:var(--bg);border-radius:2px;min-width:50px}
-.usage-pill .fill{height:100%;border-radius:2px;transition:width .3s}
-.usage-pill .limit{color:var(--text3)}
+/* ── Usage pill ── */
+.pill{display:flex;align-items:center;gap:7px;font-size:11px}
+.pill-used{color:var(--text);font-weight:600}
+.pill-bar{flex:1;height:3px;background:rgba(255,255,255,.06);border-radius:2px;min-width:40px}
+.pill-fill{height:100%;border-radius:2px;transition:width .4s}
+.pill-lim{color:var(--text3);font-size:10px}
 
-.toggle{width:34px;height:18px;border-radius:10px;background:var(--surface3);position:relative;cursor:pointer;transition:all .3s cubic-bezier(0.4,0,0.2,1);border:1px solid var(--border)}
-.toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .3s cubic-bezier(0.4,0,0.2,1)}
-.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 12px rgba(34,197,94,0.3)}
-.toggle.on::after{left:18px;background:#fff}
+/* ── Toggle ── */
+.toggle{width:32px;height:17px;border-radius:9px;background:rgba(255,255,255,.08);position:relative;cursor:pointer;transition:all .28s;border:1px solid rgba(255,255,255,.06);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .28s cubic-bezier(.4,0,.2,1)}
+.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 10px rgba(74,222,128,.3)}
+.toggle.on::after{left:17px;background:#fff}
 
-.sys-bar{height:6px;background:var(--surface3);border-radius:3px;overflow:hidden}
-.sys-bar-fill{height:100%;border-radius:3px;transition:width .4s}
+/* ── Sys bar ── */
+.sys-bar{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden}
+.sys-fill{height:100%;border-radius:3px;transition:width .4s}
 
-.status-item{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border)}
-.status-item:last-child{border-bottom:none}
-.status-key{color:var(--text2);font-size:12px;display:flex;align-items:center;gap:8px}
-.status-val{color:var(--text);font-weight:600;font-size:12px}
+/* ── Status list ── */
+.sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.sl-item:last-child{border-bottom:none}
+.sl-k{color:var(--text3);font-size:11.5px}
+.sl-v{color:var(--text);font-weight:600;font-size:11.5px}
 
-.form-group{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
-.form-label{font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.04em}
-.form-input,.form-select{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:13px;outline:none;color:var(--text);background:var(--surface2);transition:all .2s}
-.form-input:focus,.form-select:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
-.form-select option{background:var(--surface2);color:var(--text)}
-.form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
-.form-row .form-group{margin-bottom:0;flex:1;min-width:100px}
+/* ── Form ── */
+.fg{display:flex;flex-direction:column;gap:4px;margin-bottom:11px}
+.fl{font-size:9.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em}
+.fi,.fs{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text);background:rgba(255,255,255,.04);transition:all .2s}
+.fi:focus,.fs:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(255,215,0,.08)}
+.fi::placeholder{color:rgba(255,255,255,.15)}
+.fs option{background:#111118}
+.fr{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.fr .fg{margin-bottom:0;flex:1;min-width:90px}
 
-.empty{text-align:center;padding:40px 16px;color:var(--text3)}
-.empty-icon{font-size:32px;margin-bottom:10px;opacity:0.3}
+/* ── Action btns ── */
+.act-btn{font-family:inherit;font-size:9.5px;font-weight:700;border-radius:6px;padding:4px 8px;cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .18s}
+.act-copy{background:rgba(255,215,0,.08);color:rgba(255,215,0,.8);border-color:rgba(255,215,0,.18)}
+.act-copy:hover{background:var(--gold);color:#000;border-color:var(--gold);transform:translateY(-1px)}
+.act-sub{background:var(--green-dim);color:var(--green);border-color:rgba(74,222,128,.2)}
+.act-sub:hover{background:var(--green);color:#000;border-color:var(--green);transform:translateY(-1px)}
+.act-qr{background:rgba(167,139,250,.1);color:#a78bfa;border-color:rgba(167,139,250,.2)}
+.act-qr:hover{background:#a78bfa;color:#fff;border-color:#a78bfa;transform:translateY(-1px)}
+.act-edit{background:rgba(251,191,36,.08);color:var(--yellow);border-color:rgba(251,191,36,.2)}
+.act-edit:hover{background:var(--yellow);color:#000;border-color:var(--yellow);transform:translateY(-1px)}
+.act-del{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.18)}
+.act-del:hover{background:var(--red);color:#fff;border-color:var(--red);transform:translateY(-1px)}
 
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .3s cubic-bezier(0.4,0,0.2,1);z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.2);backdrop-filter:blur(20px)}
+/* ── Toast ── */
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:9px 18px;font-size:12px;font-weight:600;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 8px 32px rgba(0,0,0,.5),var(--gold-glow)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.toast.error{border-color:var(--red-dim);color:var(--red)}
+.toast.err{border-color:rgba(248,113,113,.3);color:var(--red)}
 
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
-.modal-overlay.show{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.3),0 0 40px var(--primary-glow);transform:scale(0.9);opacity:0;transition:all .4s cubic-bezier(0.34,1.56,0.64,1)}
-.modal-overlay.show .modal{transform:scale(1);opacity:1}
-.modal-title{font-size:15px;font-weight:700;margin-bottom:18px;color:var(--text)}
-.modal-close{position:absolute;top:12px;left:12px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:all .2s}
-.modal-close:hover{background:var(--red-dim);color:var(--red);border-color:rgba(255,77,106,0.2)}
-.qr-box{text-align:center;padding:24px;background:var(--surface2);border-radius:14px;margin-top:14px;border:1px solid var(--border);transition:all .3s}
-.qr-box:hover{border-color:var(--primary);box-shadow:0 0 20px var(--primary-glow)}
-.qr-box img{max-width:220px;border-radius:10px;border:3px solid var(--surface);box-shadow:0 4px 16px rgba(0,0,0,0.1);transition:transform .3s}
-.qr-box img:hover{transform:scale(1.05)}
+/* ── Modal ── */
+.mo{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+.mo.show{display:flex}
+.mo-box{background:rgba(10,10,16,.98);border:1px solid var(--border2);border-radius:18px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:0 0 0 1px rgba(255,215,0,.06),0 40px 80px rgba(0,0,0,.7),var(--gold-glow);transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
+.mo.show .mo-box{transform:scale(1);opacity:1}
+.mo-box::before{content:'';position:absolute;top:0;left:20%;right:20%;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,.5),transparent)}
+.mo-title{font-family:'Cinzel',serif;font-size:14px;font-weight:700;margin-bottom:16px;color:var(--gold);letter-spacing:.06em}
+.mo-close{position:absolute;top:14px;right:14px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text3);width:26px;height:26px;border-radius:7px;cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.mo-close:hover{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.2)}
+.dv{padding:8px 12px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:7px;font-size:11.5px;color:var(--text3);word-break:break-all;font-family:'SF Mono',Consolas,monospace;line-height:1.5}
+.dl{font-size:9px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+.qr-box{text-align:center;padding:20px;background:rgba(255,255,255,.03);border-radius:12px;border:1px solid var(--border);margin-top:12px}
+.qr-box img{max-width:200px;border-radius:8px;border:3px solid rgba(255,215,0,.2);box-shadow:var(--gold-glow)}
 
-@keyframes qrSlideUp{0%{transform:translateY(30px) scale(0.9);opacity:0}60%{transform:translateY(-4px) scale(1.02);opacity:1}100%{transform:translateY(0) scale(1);opacity:1}}
-@keyframes qrGlow{0%,100%{box-shadow:0 0 10px var(--primary-glow)}50%{box-shadow:0 0 25px var(--primary-glow),0 0 50px rgba(220,38,38,0.08)}}
-.qr-box.animate-in{animation:qrSlideUp .5s cubic-bezier(0.34,1.56,0.64,1) forwards}
-.qr-box.animate-glow{animation:qrGlow 2s ease-in-out 1}
+/* ── Toolbar ── */
+.tb{display:flex;align-items:center;gap:7px;margin-bottom:10px;flex-wrap:wrap}
+.search-wrap{flex:1;min-width:160px;position:relative}
+.search-wrap svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--text3)}
+.search-wrap input{width:100%;padding:7px 11px 7px 30px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;font-family:inherit;outline:none;transition:all .2s}
+.search-wrap input:focus{border-color:var(--border2);box-shadow:0 0 0 2px rgba(255,215,0,.08)}
+.filter-chips{display:flex;gap:3px;padding:3px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
+.chip{padding:5px 11px;border-radius:6px;font-size:10.5px;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .18s;font-family:inherit}
+.chip.active{background:var(--gold);color:#000}
+.chip:hover:not(.active){background:var(--surface3);color:rgba(255,215,0,.6)}
 
-.btn-copy,.btn-qr{position:relative;overflow:hidden;font-family:inherit;font-size:11px;font-weight:600;border-radius:8px;padding:5px 10px;cursor:pointer;border:none;display:inline-flex;align-items:center;gap:4px;transition:all .25s cubic-bezier(0.34,1.56,0.64,1)}
-.btn-copy{background:var(--primary-dim);color:var(--primary);border:1px solid rgba(220,38,38,0.15)}
-.btn-copy:hover{background:var(--primary);color:#fff;transform:translateY(-2px);box-shadow:0 4px 12px var(--primary-glow)}
-.btn-copy:active{transform:translateY(0) scale(0.96)}
-.btn-qr{background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,0.15)}
-.btn-qr:hover{background:var(--green);color:#fff;transform:translateY(-2px);box-shadow:0 4px 12px rgba(34,197,94,0.2)}
-.btn-qr:active{transform:translateY(0) scale(0.96)}
-.btn-copy .ripple,.btn-qr .ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,0.3);transform:scale(0);animation:rippleEffect .5s ease-out;pointer-events:none}
-@keyframes rippleEffect{to{transform:scale(3);opacity:0}}
-.detail-label{font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:5px}
-.detail-value{padding:8px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--text2);word-break:break-all;font-family:'SF Mono',Monaco,Consolas,monospace;line-height:1.6}
-.detail-row{display:flex;gap:12px;margin-bottom:12px}
-.detail-row .detail-col{flex:1}
-.detail-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:14px}
+/* ── Mobile cards ── */
+.m-cards{display:none;flex-direction:column;gap:7px}
+.m-card{border:1px solid var(--border);border-radius:10px;padding:11px;background:var(--surface2)}
+.m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.m-card-acts{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
 
-.inbounds-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.search-box{flex:1;min-width:180px;position:relative}
-.search-box input{width:100%;padding:8px 12px 8px 32px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;font-family:inherit;outline:none;transition:all .2s}
-.search-box input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
-.search-box svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3)}
-.filter-chips{display:flex;gap:3px;padding:3px 5px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
-.chip{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .2s;font-family:inherit}
-.chip.active{background:var(--primary);color:#fff}
-.chip:hover:not(.active){background:var(--surface3);color:var(--text2)}
+/* ── Mobile header ── */
+.mob-hd{display:none;position:fixed;top:0;left:0;right:0;height:44px;background:rgba(8,8,12,.98);border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;padding:0 14px}
+.mob-toggle{width:30px;height:30px;border-radius:7px;border:1px solid var(--border);background:var(--surface2);color:var(--text3);display:flex;align-items:center;justify-content:center;cursor:pointer}
+.sb-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99}
+.sb-overlay.show{display:block}
 
-.inbound-cards{display:none;flex-direction:column;gap:8px;padding:0 4px}
-.inbound-card{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--surface2);display:flex;flex-direction:column;gap:8px}
-.inbound-card-header{display:flex;align-items:center;justify-content:space-between}
-.inbound-card-id{font-size:10px;color:var(--text3);font-weight:600}
-.inbound-card-name{font-size:13px;font-weight:600;color:var(--text)}
-.inbound-card-actions{display:flex;gap:4px;justify-content:flex-end}
-
-.mobile-header{display:none;position:fixed;top:0;left:0;right:0;height:44px;background:var(--sidebar-bg);border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;padding:0 14px}
-.menu-toggle{width:32px;height:32px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text2);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px}
-.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99}
-.sidebar-overlay.show{display:block}
+/* ── Empty ── */
+.empty{text-align:center;padding:36px;color:var(--text3)}
+.empty-ico{font-size:28px;margin-bottom:8px;opacity:.25}
 
 @media(max-width:768px){
-  .sidebar{transform:translateX(-100%);width:220px;z-index:200}
-  .sidebar.open{transform:translateX(0);box-shadow:4px 0 20px rgba(0,0,0,0.4)}
-  .main{margin-left:0;padding-top:60px;padding-left:12px;padding-right:12px}
-  .mobile-header{display:flex}
+  .sidebar{transform:translateX(-100%);width:180px !important;z-index:200}
+  .sidebar.open{transform:translateX(0);box-shadow:4px 0 24px rgba(0,0,0,.6)}
+  .main{margin-left:0;padding-top:58px;padding-left:12px;padding-right:12px}
+  .mob-hd{display:flex}
   .stats-row{grid-template-columns:1fr 1fr}
   .grid-2{grid-template-columns:1fr}
-  .inbounds-toolbar{flex-direction:column;align-items:stretch}
-  .search-box{min-width:unset}
-  .filter-chips{justify-content:center}
-  .table-wrap{display:none}
-  .inbound-cards{display:flex}
+  .tbl-wrap{display:none}
+  .m-cards{display:flex}
 }
-@media(max-width:480px){
-  .stats-row{grid-template-columns:1fr}
-}
+@media(max-width:460px){.stats-row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-
+<div class="bg-fixed"></div>
+<div class="grid-fixed"></div>
 <div class="toast" id="toast"></div>
-
-<div class="mobile-header">
-  <span style="font-weight:700;font-size:13px">Luffy</span>
-  <button class="menu-toggle" onclick="document.getElementById('sidebar').classList.toggle('open');document.getElementById('sidebar-overlay').classList.toggle('show')">&#9776;</button>
+<div class="mob-hd">
+  <span style="font-family:'Cinzel',serif;font-size:13px;font-weight:700;color:var(--gold)">LUFFY</span>
+  <button class="mob-toggle" onclick="document.getElementById('sb').classList.toggle('open');document.getElementById('sb-ov').classList.toggle('show')">&#9776;</button>
 </div>
-<div class="sidebar-overlay" id="sidebar-overlay" onclick="document.getElementById('sidebar').classList.remove('open');this.classList.remove('show')"></div>
+<div class="sb-overlay" id="sb-ov" onclick="document.getElementById('sb').classList.remove('open');this.classList.remove('show')"></div>
 
-<aside class="sidebar" id="sidebar">
-  <div class="sidebar-brand">
-    <div class="sidebar-brand-left">
-      <svg width="28" height="28" viewBox="0 0 56 56" fill="none">
-        <rect width="56" height="56" rx="14" fill="url(#lg)"/>
-        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3"/>
-        <circle cx="28" cy="18" r="3.5" fill="#fff"/>
-        <circle cx="19" cy="33" r="3.5" fill="#fff"/>
-        <circle cx="37" cy="33" r="3.5" fill="#fff"/>
-        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9"/>
-        <defs><linearGradient id="lg" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#dc2626"/><stop offset="1" stop-color="#991b1b"/></linearGradient></defs>
+<!-- ── SIDEBAR ── -->
+<aside class="sidebar" id="sb">
+  <div class="sb-brand">
+    <div class="sb-hat">
+      <svg width="36" height="30" viewBox="0 0 84 68" fill="none">
+        <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
+        <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
+        <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
+        <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
+        <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
+        <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
       </svg>
-      <span class="brand-name">Luffy</span>
     </div>
-    <div class="sidebar-brand-right">
-      <button onclick="toggleTheme()" id="theme-btn" title="Toggle theme">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-      </button>
-    </div>
+    <div class="sb-title">LUFFY</div>
   </div>
-  <nav class="sidebar-nav">
-    <div class="nav-section">Main</div>
+
+  <!-- NAV AT BOTTOM -->
+  <nav class="sb-nav">
     <button class="nav-item active" data-page="dashboard">
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-      <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span>
+      <span class="nav-label" data-en="Dashboard" data-fa="داشبورد">Dashboard</span>
     </button>
     <button class="nav-item" data-page="inbounds">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
-      <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span>
-      <span class="nav-badge" id="links-badge">0</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="23" y1="11" x2="17" y2="11"/><line x1="20" y1="8" x2="20" y2="14"/></svg>
+      <span class="nav-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</span>
+      <span class="nav-badge" id="nb">0</span>
     </button>
     <button class="nav-item" data-page="traffic">
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-      <span data-en="Traffic" data-fa="ترافیک">Traffic</span>
+      <span class="nav-label" data-en="Traffic" data-fa="ترافیک">Traffic</span>
     </button>
     <button class="nav-item" data-page="addresses">
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-      <span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
+      <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
     </button>
-    <div class="nav-section">System</div>
     <button class="nav-item" data-page="security">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-      <span data-en="Security" data-fa="امنیت">Security</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+      <span class="nav-label" data-en="Security" data-fa="امنیت">Security</span>
     </button>
   </nav>
-  <div class="sidebar-footer">
-    <div class="footer-row">
-      <button class="footer-btn active" onclick="setLang('en')" id="lang-en">EN</button>
-      <button class="footer-btn" onclick="setLang('fa')" id="lang-fa">FA</button>
+
+  <div class="sb-bottom">
+    <div class="lang-row">
+      <button class="lang-btn active" id="l-en" onclick="setLang('en')">EN</button>
+      <button class="lang-btn" id="l-fa" onclick="setLang('fa')">FA</button>
     </div>
     <button class="logout-btn" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login')">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
       <span data-en="Logout" data-fa="خروج">Logout</span>
     </button>
-    <div class="version">v1.0</div>
   </div>
 </aside>
 
+<!-- ── MAIN ── -->
 <main class="main">
 
+  <!-- Dashboard -->
   <section class="page active" id="page-dashboard">
     <div class="page-header">
       <div>
         <div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div>
-        <div class="page-sub" id="last-update">Updated: --</div>
+        <div class="page-sub" id="last-up">–</div>
       </div>
       <div style="display:flex;gap:6px">
-        <button class="btn btn-secondary" onclick="quickCreate(0.5,'GB')">+ 0.5 GB</button>
-        <button class="btn btn-primary" onclick="quickCreate(1,'GB')">+ 1 GB</button>
+        <button class="btn btn-ghost btn-sm" onclick="qCreate(.5,'GB')">+ 0.5 GB</button>
+        <button class="btn btn-gold btn-sm" onclick="qCreate(1,'GB')">+ 1 GB</button>
       </div>
     </div>
     <div class="stats-row">
-      <div class="stat-card">
-        <div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div>
-        <div class="stat-value" id="s-traffic">--<span class="stat-unit"> MB</span></div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-        <div class="stat-value" id="s-links">--</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div>
-        <div class="stat-value" id="s-uptime" style="font-size:16px">--</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div>
-        <div class="stat-value" id="s-domain" style="font-size:11px;word-break:break-all;font-weight:500">--</div>
-      </div>
+      <div class="stat-card" style="animation-delay:.08s"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
+      <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
+      <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">–</div></div>
+      <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">–</div></div>
     </div>
     <div class="grid-2">
       <div class="card">
-        <div class="card-header"><div class="card-title">CPU Usage</div><span id="s-cpu-val" style="font-size:18px;font-weight:700;color:var(--primary)">--%</span></div>
-        <div class="sys-bar"><div class="sys-bar-fill" id="s-cpu-bar" style="width:0%;background:var(--primary)"></div></div>
+        <div class="card-hd"><div class="card-title">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--gold)">–%</span></div>
+        <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--gold)"></div></div>
       </div>
       <div class="card">
-        <div class="card-header"><div class="card-title">Memory</div><span id="s-mem-val" style="font-size:18px;font-weight:700;color:var(--green)">--%</span></div>
-        <div class="sys-bar"><div class="sys-bar-fill" id="s-mem-bar" style="width:0%;background:var(--green)"></div></div>
+        <div class="card-hd"><div class="card-title">Memory</div><span id="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">–%</span></div>
+        <div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green)"></div></div>
       </div>
     </div>
     <div class="card">
-      <div class="card-header"><div class="card-title">Traffic Chart</div></div>
-      <div style="height:180px"><canvas id="trafficChart"></canvas></div>
+      <div class="card-hd"><div class="card-title">Hourly Traffic</div></div>
+      <div style="height:170px"><canvas id="tc"></canvas></div>
     </div>
   </section>
 
+  <!-- Inbounds -->
   <section class="page" id="page-inbounds">
     <div class="page-header">
       <div>
         <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-        <div class="page-sub">VLESS over WebSocket</div>
+        <div class="page-sub">VLESS over WebSocket · TLS</div>
       </div>
-      <button class="btn btn-primary" onclick="showAddModal()">+ Add</button>
+      <button class="btn btn-gold" onclick="showAddMo()">+ Add</button>
     </div>
-    <div class="inbounds-toolbar">
-      <div class="search-box">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input id="inbound-search" placeholder="Search by name or UUID..." oninput="filterInbounds()">
+    <div class="tb">
+      <div class="search-wrap">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input id="srch" placeholder="Search name…" oninput="filterLinks()">
       </div>
       <div class="filter-chips">
         <button class="chip active" onclick="setFilter('all',this)">All</button>
         <button class="chip" onclick="setFilter('active',this)">Active</button>
-        <button class="chip" onclick="setFilter('disabled',this)">Disabled</button>
+        <button class="chip" onclick="setFilter('off',this)">Off</button>
       </div>
     </div>
-    <div class="card" style="border-radius:12px;overflow:hidden;padding:0">
-      <div class="table-wrap">
-        <table class="table">
+    <div class="card" style="padding:0;overflow:hidden">
+      <div class="tbl-wrap">
+        <table class="tbl">
           <thead><tr>
-            <th style="width:32px">ID</th>
-            <th>Remark</th>
-            <th style="width:56px">Type</th>
-            <th>Traffic</th>
-            <th style="width:80px">IPs</th>
-            <th style="width:70px">Expiry</th>
-            <th style="width:64px">Status</th>
-            <th style="width:100px">Actions</th>
+            <th>#</th><th>Name</th><th>Type</th><th>Usage</th><th>IPs</th><th>Expiry</th><th>Status</th><th>Actions</th>
           </tr></thead>
-          <tbody id="links-tbody"></tbody>
+          <tbody id="ltb"></tbody>
         </table>
       </div>
-      <div class="inbound-cards" id="inbound-cards"></div>
-      <div class="empty" id="links-empty" style="display:none">
-        <div class="empty-icon">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/></svg>
-        </div>
-        <div>No inbounds found</div>
-      </div>
+      <div class="m-cards" id="mcards"></div>
+      <div class="empty" id="lempty" style="display:none"><div class="empty-ico">◦</div>No inbounds found</div>
     </div>
   </section>
 
+  <!-- Traffic -->
   <section class="page" id="page-traffic">
-    <div class="page-header"><div><div class="page-title">Traffic</div><div class="page-sub">Traffic statistics</div></div></div>
+    <div class="page-header"><div><div class="page-title">Traffic</div><div class="page-sub">Statistics</div></div></div>
     <div class="card">
-      <div class="card-header"><div class="card-title">Overview</div></div>
-      <div class="status-item"><span class="status-key">Total Traffic</span><span class="status-val" id="t-traffic">-- MB</span></div>
-      <div class="status-item"><span class="status-key">Total Requests</span><span class="status-val" id="t-reqs">--</span></div>
-      <div class="status-item"><span class="status-key">Uptime</span><span class="status-val" id="t-uptime">--</span></div>
+      <div class="sl-item"><span class="sl-k">Total Traffic</span><span class="sl-v" id="t-tr">–</span></div>
+      <div class="sl-item"><span class="sl-k">Total Requests</span><span class="sl-v" id="t-rq">–</span></div>
+      <div class="sl-item"><span class="sl-k">Uptime</span><span class="sl-v" id="t-up">–</span></div>
     </div>
   </section>
 
+  <!-- Clean IP -->
   <section class="page" id="page-addresses">
     <div class="page-header">
-      <div>
-        <div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div>
-        <div class="page-sub" data-en="IPs and domains for subscription configs" data-fa="آی‌پی و دامنه‌ها برای کانفیگ‌های سابسکریپشن">IPs and domains for subscription configs</div>
-      </div>
-      <button class="btn btn-primary" onclick="showAddAddressModal()">+ Add</button>
+      <div><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
+      <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
     </div>
     <div class="card">
-      <div class="card-header"><div class="card-title" data-en="Clean IP List" data-fa="لیست آی‌پی تمیز">Clean IP List</div></div>
-      <div class="status-item" style="flex-direction:column;gap:8px">
-        <div style="display:flex;justify-content:space-between;width:100%">
-          <span class="status-key" style="color:var(--text3);font-size:11px">Default: www.speedtest.net</span>
-        </div>
-        <div id="address-list" style="display:flex;flex-direction:column;gap:6px;width:100%"></div>
-      </div>
+      <div style="font-size:10px;color:var(--text3);margin-bottom:10px">Default: www.speedtest.net</div>
+      <div id="addr-list"></div>
     </div>
   </section>
 
+  <!-- Security -->
   <section class="page" id="page-security">
     <div class="page-header"><div><div class="page-title">Security</div><div class="page-sub">Change panel password</div></div></div>
-    <div class="card" style="max-width:400px">
-      <div class="form-group">
-        <label class="form-label">Current Password</label>
-        <input class="form-input" type="password" id="cur-pw" placeholder="Enter current password">
-      </div>
-      <div class="form-group">
-        <label class="form-label">New Password</label>
-        <input class="form-input" type="password" id="new-pw" placeholder="Min 4 characters">
-      </div>
-      <button class="btn btn-primary" onclick="changePassword()" style="margin-top:4px">Update Password</button>
+    <div class="card" style="max-width:380px">
+      <div class="fg"><label class="fl">Current Password</label><input class="fi" type="password" id="cpw" placeholder="Current password"></div>
+      <div class="fg"><label class="fl">New Password</label><input class="fi" type="password" id="npw" placeholder="Min 4 chars"></div>
+      <button class="btn btn-gold" onclick="chgPw()" style="margin-top:4px">Update Password</button>
     </div>
   </section>
+
 </main>
 
-<!-- Add Inbound Modal — Feature #5: Days Valid input instead of date picker -->
-<div class="modal-overlay" id="add-modal" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="$('#add-modal').classList.remove('show')">x</button>
-    <div class="modal-title">Add Inbound</div>
-    <div class="form-group">
-      <label class="form-label">Remark</label>
-      <input class="form-input" id="new-label" placeholder="e.g. User 1">
+<!-- Add Inbound Modal -->
+<div class="mo" id="mo-add" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="$m('mo-add').classList.remove('show')">✕</button>
+    <div class="mo-title">ADD INBOUND</div>
+    <div class="fg"><label class="fl">Remark</label><input class="fi" id="nl" placeholder="e.g. User 1"></div>
+    <div class="fr">
+      <div class="fg"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:90px"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
     </div>
-    <div class="form-row">
-      <div class="form-group" style="flex:1">
-        <label class="form-label">Traffic Limit</label>
-        <input class="form-input" id="new-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
-      </div>
-      <div class="form-group" style="min-width:80px;max-width:100px">
-        <label class="form-label">Unit</label>
-        <select class="form-select" id="new-unit"><option value="GB">GB</option></select>
-      </div>
-    </div>
-    <div class="form-group">
-      <label class="form-label">Max IPs</label>
-      <input class="form-input" id="new-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
-    </div>
-    <!-- Feature #5: Days Valid number input -->
-    <div class="form-group">
-      <label class="form-label">Days Valid</label>
-      <input class="form-input" id="new-days" type="number" min="0" step="1" placeholder="0 = No expiry">
-    </div>
-    <button class="btn btn-primary" onclick="createLink()" style="width:100%;margin-top:8px;justify-content:center">Create</button>
+    <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+    <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:8px">CREATE</button>
   </div>
 </div>
 
-<div class="modal-overlay" id="detail-modal" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="modal" style="position:relative;max-width:540px">
-    <button class="modal-close" onclick="$('#detail-modal').classList.remove('show')">x</button>
-    <div class="modal-title" id="detail-title">Inbound Details</div>
-    <div id="detail-content"></div>
+<!-- Edit Modal -->
+<div class="mo" id="mo-edit" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="$m('mo-edit').classList.remove('show')">✕</button>
+    <div class="mo-title" id="et">EDIT INBOUND</div>
+    <input type="hidden" id="eu">
+    <div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
+    <div class="fr">
+      <div class="fg"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:90px"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
+    </div>
+    <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = no change"></div>
+    <div style="display:flex;gap:7px;margin-top:10px">
+      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center">SAVE</button>
+      <button class="btn btn-danger" onclick="resetTraf()">Reset Traffic</button>
+    </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="qr-modal" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="$('#qr-modal').classList.remove('show')">x</button>
-    <div class="modal-title">QR Code</div>
+<!-- QR Modal -->
+<div class="mo" id="mo-qr" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box" style="max-width:340px">
+    <button class="mo-close" onclick="$m('mo-qr').classList.remove('show')">✕</button>
+    <div class="mo-title">QR CODE</div>
     <div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
-    <div style="margin-top:14px;text-align:center;display:flex;gap:8px;justify-content:center">
-      <button class="btn btn-primary btn-sm" onclick="downloadQR()" style="padding:8px 20px">Download</button>
-      <button class="btn btn-secondary btn-sm" onclick="$('#qr-modal').classList.remove('show')" style="padding:8px 20px">Close</button>
+    <div style="display:flex;gap:6px;margin-top:12px;justify-content:center">
+      <button class="btn btn-gold btn-sm" onclick="dlQR()">Download</button>
+      <button class="btn btn-ghost btn-sm" onclick="$m('mo-qr').classList.remove('show')">Close</button>
     </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="edit-modal" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="$('#edit-modal').classList.remove('show')">x</button>
-    <div class="modal-title" id="edit-title">Edit Inbound</div>
-    <input type="hidden" id="edit-uid">
-    <div class="form-group">
-      <label class="form-label">Name</label>
-      <input class="form-input" id="edit-name" readonly style="opacity:0.6;cursor:not-allowed">
-    </div>
-    <div class="form-row">
-      <div class="form-group" style="flex:1">
-        <label class="form-label">Traffic Limit</label>
-        <input class="form-input" id="edit-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
-      </div>
-      <div class="form-group" style="min-width:80px;max-width:100px">
-        <label class="form-label">Unit</label>
-        <select class="form-select" id="edit-unit"><option value="GB">GB</option></select>
-      </div>
-    </div>
-    <div class="form-group">
-      <label class="form-label">Max IPs</label>
-      <input class="form-input" id="edit-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
-    </div>
-    <div class="form-group">
-      <label class="form-label">Extend by Days</label>
-      <input class="form-input" id="edit-days" type="number" min="0" step="1" placeholder="0 = No change">
-    </div>
-    <div style="display:flex;gap:8px;margin-top:12px">
-      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center">Save</button>
-      <button class="btn btn-danger" onclick="resetEditTraffic()" style="justify-content:center">Reset Traffic</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-overlay" id="add-address-modal" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="$('#add-address-modal').classList.remove('show')">x</button>
-    <div class="modal-title" data-en="Add Clean IP" data-fa="افزودن آی‌پی تمیز">Add Clean IP</div>
-    <div class="form-group">
-      <label class="form-label" data-en="IPs or Domains (one per line)" data-fa="آی‌پی یا دامنه (هر خط یکی)">IPs or Domains (one per line)</label>
-      <textarea class="form-input" id="new-address" rows="5" placeholder="8.8.8.8&#10;example.com&#10;1.0.0.1" style="resize:vertical;font-family:monospace"></textarea>
-    </div>
-    <button class="btn btn-primary" onclick="addAddresses()" style="width:100%;margin-top:8px;justify-content:center" data-en="Add All" data-fa="افزودن همه">Add All</button>
+<!-- Add Address Modal -->
+<div class="mo" id="mo-addr" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="$m('mo-addr').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="ADD CLEAN IP" data-fa="افزودن آی‌پی">ADD CLEAN IP</div>
+    <div class="fg"><label class="fl" data-en="IPs / Domains (one per line)" data-fa="آی‌پی یا دامنه">IPs / Domains (one per line)</label><textarea class="fi" id="na" rows="5" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:monospace"></textarea></div>
+    <button class="btn btn-gold" onclick="addAddrs()" style="width:100%;justify-content:center;margin-top:6px" data-en="ADD ALL" data-fa="افزودن">ADD ALL</button>
   </div>
 </div>
 
 <script>
-let lang=localStorage.getItem('ren_lang')||'en';
-let theme=localStorage.getItem('ren_theme')||'dark';
-let allLinks=[];let currentFilter='all';let statsData={};let trafficChart=null;
-
-function setLang(l){lang=l;document.getElementById('lang-en').classList.toggle('active',l==='en');document.getElementById('lang-fa').classList.toggle('active',l==='fa');document.body.dir=l==='fa'?'rtl':'ltr';document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v});localStorage.setItem('ren_lang',l)}
-function applyTheme(t){theme=t;document.documentElement.setAttribute('data-theme',t);localStorage.setItem('ren_theme',t);const btn=$('#theme-btn');if(btn)btn.innerHTML=t==='dark'?'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>'}
-function toggleTheme(){applyTheme(theme==='dark'?'light':'dark')}
-function showAddModal(){$('#add-modal').classList.add('show')}
-function setFilter(f,el){currentFilter=f;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');filterInbounds()}
-function filterInbounds(){const q=($('#inbound-search')?.value||'').toLowerCase();let filtered=allLinks;if(currentFilter==='active')filtered=filtered.filter(l=>l.active);if(currentFilter==='disabled')filtered=filtered.filter(l=>!l.active);if(q)filtered=filtered.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));renderLinks(filtered)}
-function fmtBytes(b){return b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB'}
-function fmtLimit(b){if(b===0)return'Unlimited';const gb=b/1073741824;return(gb%1===0?gb.toFixed(0):gb.toFixed(1))+' GB'}
-function fmtExpiry(expiresAt){if(!expiresAt)return'∞';const diff=new Date(expiresAt)-new Date();if(diff<=0)return'Expired';const days=Math.floor(diff/86400000);if(days>0)return days+'d';const hrs=Math.floor(diff/3600000);return hrs+'h';}
+let lang=localStorage.getItem('ll')||'en';
+let allLinks=[];let cf='all';let sData={};let tChart=null;let allAddrs=[];
 
 const $=s=>document.querySelector(s);
-const $$=s=>document.querySelectorAll(s);
-$$('.nav-item').forEach(el=>el.addEventListener('click',()=>switchPage(el.dataset.page)));
-function switchPage(id){$$('.page').forEach(p=>p.classList.remove('active'));$(`#page-${id}`)?.classList.add('active');$$('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));$('#sidebar').classList.remove('open');$('#sidebar-overlay').classList.remove('show')}
-function toast(msg,err=false){const t=$('#toast');t.textContent=msg;t.className='toast'+(err?' error':'')+' show';setTimeout(()=>t.classList.remove('show'),3000)}
-function esc(s){return s.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+const $m=id=>document.getElementById(id);
+const esc=s=>s.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-async function loadStats(){
-  try{
-    const r=await fetch('/stats');if(!r.ok)throw new Error();statsData=await r.json();
-    const pulse=(el,val)=>{if(el.textContent!==val){el.style.transition='color .2s';el.style.color='var(--primary)';el.textContent=val;setTimeout(()=>el.style.color='',400)}};
-    pulse($('#s-traffic'),statsData.total_traffic_mb+' MB');$('#s-traffic').innerHTML=statsData.total_traffic_mb+'<span class="stat-unit"> MB</span>';
-    pulse($('#s-links'),statsData.links_count);
-    pulse($('#s-uptime'),statsData.uptime);
-    pulse($('#s-domain'),statsData.domain);
-    $('#links-badge').textContent=statsData.links_count;
-    $('#last-update').textContent=(lang==='fa'?'Last update: ':'Updated: ')+new Date().toLocaleTimeString(lang==='fa'?'fa-IR':'en-US');
-    if($('#t-traffic'))$('#t-traffic').textContent=statsData.total_traffic_mb+' MB';
-    if($('#t-reqs'))$('#t-reqs').textContent=statsData.total_requests.toLocaleString();
-    if($('#t-uptime'))$('#t-uptime').textContent=statsData.uptime;
-    if(statsData.cpu_percent!==undefined){const c=statsData.cpu_percent;const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--primary)';$('#s-cpu-val').textContent=c.toFixed(1)+'%';$('#s-cpu-val').style.color=cc;$('#s-cpu-bar').style.width=c+'%';$('#s-cpu-bar').style.background=cc}
-    if(statsData.memory_percent!==undefined){const m=statsData.memory_percent;const mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';$('#s-mem-val').textContent=m.toFixed(1)+'%';$('#s-mem-val').style.color=mc;$('#s-mem-bar').style.width=m+'%';$('#s-mem-bar').style.background=mc}
-    updateChart();
-  }catch(e){}
+function setLang(l){
+  lang=l;
+  $m('l-en').classList.toggle('active',l==='en');
+  $m('l-fa').classList.toggle('active',l==='fa');
+  document.body.dir=l==='fa'?'rtl':'ltr';
+  document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v});
+  localStorage.setItem('ll',l);
 }
 
-async function loadLinks(){try{const r=await fetch('/api/links');if(!r.ok)throw new Error();const d=await r.json();allLinks=d.links||[];filterInbounds();}catch(e){}}
+document.querySelectorAll('.nav-item[data-page]').forEach(el=>el.addEventListener('click',()=>switchPage(el.dataset.page)));
+function switchPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  $m('page-'+id)?.classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  $m('sb').classList.remove('open');$m('sb-ov').classList.remove('show');
+}
+
+function toast(msg,e=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(e?' err':'')+' show';setTimeout(()=>t.classList.remove('show'),3000)}
+
+function fmtB(b){return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB'}
+function fmtLim(b){if(!b)return'∞';const g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB'}
+function fmtExp(ea){if(!ea)return'∞';const d=new Date(ea)-new Date();if(d<=0)return'Expired';const days=Math.floor(d/86400000);if(days>0)return days+'d';return Math.floor(d/3600000)+'h'}
+
+function setFilter(f,el){cf=f;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');filterLinks()}
+function filterLinks(){const q=($m('srch')?.value||'').toLowerCase();let r=allLinks;if(cf==='active')r=r.filter(l=>l.active);if(cf==='off')r=r.filter(l=>!l.active);if(q)r=r.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));renderLinks(r)}
 
 function renderLinks(links){
-  const tbody=$('#links-tbody');const empty=$('#links-empty');const cards=$('#inbound-cards');
-  if(!links.length){tbody.innerHTML='';cards.innerHTML='';empty.style.display='block';return;}
-  empty.style.display='none';
+  const tb=$m('ltb'),em=$m('lempty'),mc=$m('mcards');
+  if(!links.length){tb.innerHTML='';mc.innerHTML='';em.style.display='block';return}
+  em.style.display='none';
   let idx=links.length;
   const rows=links.map(l=>{
     const u=l.used_bytes,lim=l.limit_bytes;
-    const uF=fmtBytes(u);const lF=fmtLimit(lim);
     const pct=lim>0?Math.min(100,(u/lim)*100):0;
-    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
+    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--gold)';
+    const ex=fmtExp(l.expires_at);
+    const ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)';
     const i=idx--;
-    const expStr=fmtExpiry(l.expires_at);
-    const expColor=expStr==='Expired'?'var(--red)':expStr==='∞'?'var(--text3)':'var(--text2)';
-    return {l,uF,lF,pct,col,i,maxConn:l.max_connections||0,curConn:l.current_connections||0,expStr,expColor};
+    const cc=l.current_connections||0,mc2=l.max_connections||0;
+    return {l,pct,col,ex,ec,i,cc,mc2,u,lim};
   });
-  tbody.innerHTML=rows.map(r=>`<tr>
-    <td style="color:var(--text3);font-size:11px">${r.i}</td>
-    <td style="font-weight:600;font-size:13px">${esc(r.l.label)}</td>
+  tb.innerHTML=rows.map(r=>`<tr>
+    <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
+    <td style="font-weight:600">${esc(r.l.label)}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
-    <td><div class="usage-pill"><span class="used">${r.uF}</span><div class="bar"><div class="fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="limit">${r.lF}</span></div></td>
-    <td style="font-size:12px;font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text2)'}">${r.curConn}/${r.maxConn||'∞'}</td>
-    <td style="font-size:11px;font-weight:600;color:${r.expColor}">${r.expStr}</td>
-    <td><span class="tag ${r.l.active?'tag-active':'tag-disabled'}">${r.l.active?'On':'Off'}</span></td>
-    <td><div style="display:flex;gap:3px;align-items:center">
-      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="toggleLink(this)" title="Toggle"></button>
-      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" title="Edit" style="background:rgba(251,191,36,0.1);color:var(--yellow);border:1px solid rgba(251,191,36,0.2)">e</button>
-      <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')" title="Copy">c</button>
-      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" title="Sub" style="background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,0.15)">s</button>
-      <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')" title="QR">qr</button>
-      <button class="btn btn-danger btn-sm" onclick="deleteLink('${r.l.uuid}')" title="Delete">x</button>
+    <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
+    <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
+    <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
+    <td><span class="tag ${r.l.active?'tag-on':'tag-off'}">${r.l.active?'On':'Off'}</span></td>
+    <td><div style="display:flex;gap:3px;align-items:center;flex-wrap:wrap">
+      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
+      <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">Edit</button>
+      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link)}')">Copy</button>
+      <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">Sub</button>
+      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link)}')">QR</button>
+      <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">Del</button>
     </div></td>
   </tr>`).join('');
-
-  cards.innerHTML=rows.map(r=>`<div class="inbound-card">
-    <div class="inbound-card-header">
-      <div style="display:flex;align-items:center;gap:8px">
-        <span class="inbound-card-id">#${r.i}</span>
-        <span class="inbound-card-name">${esc(r.l.label)}</span>
+  mc.innerHTML=rows.map(r=>`<div class="m-card">
+    <div class="m-card-hd">
+      <div style="display:flex;align-items:center;gap:7px">
+        <span style="font-size:10px;color:var(--text3)">#${r.i}</span>
+        <span style="font-weight:600;font-size:13px">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
       </div>
-      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="toggleLink(this)"></button>
+      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
-    <div class="usage-pill"><span class="used">${r.uF}</span><div class="bar"><div class="fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="limit">${r.lF}</span></div>
-    <div style="display:flex;align-items:center;gap:10px;font-size:11px">
-      <span style="font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text)'}">${r.curConn}/${r.maxConn||'∞'}</span><span style="color:var(--text3)">IPs</span>
-      <span style="color:${r.expColor};font-weight:600">⏳ ${r.expStr}</span>
-    </div>
-    <div class="inbound-card-actions">
-      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" style="background:rgba(251,191,36,0.1);color:var(--yellow);border:1px solid rgba(251,191,36,0.2)">e</button>
-      <button class="btn-copy" onclick="copyAllConfigs('${r.l.uuid}')">c</button>
-      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" style="background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,0.15)">s</button>
-      <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')">qr</button>
-      <button class="btn btn-danger btn-sm" onclick="deleteLink('${r.l.uuid}')">x</button>
+    <div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div>
+    <div style="font-size:10.5px;color:${r.ec};margin-top:4px;font-weight:600">⏳ ${r.ex} · ${r.cc}/${r.mc2||'∞'} IPs</div>
+    <div class="m-card-acts">
+      <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">Edit</button>
+      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link)}')">Copy</button>
+      <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">Sub</button>
+      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link)}')">QR</button>
+      <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">Del</button>
     </div>
   </div>`).join('');
 }
 
-async function toggleLink(el){
-  const uid=el.dataset.uid;
-  const link=allLinks.find(l=>l.uuid===uid);
-  if(!link)return;
-  const newActive=!link.active;
-  try{
-    await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:newActive})});
-    link.active=newActive;
-    filterInbounds();
-    loadStats();
-  }catch(e){}
+async function togLink(el){
+  const uid=el.dataset.uid;const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
+  const na=!l.active;
+  try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch(e){}
 }
-
-async function quickCreate(limit,unit){
-  const names=['Ali','Sara','Reza','Nima','Mina','Arash','Yalda','Dariush','Cyrus','Shirin'];
-  const name=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*100);
-  try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:name,limit_value:limit,limit_unit:unit})});if(!r.ok)throw new Error();toast('Created: '+name);await loadLinks();await loadStats();}catch(e){toast('Error',true)}
+async function qCreate(v,u){
+  const ns=['Ali','Sara','Reza','Nima','Mina','Arash'];
+  const n=ns[Math.floor(Math.random()*ns.length)]+'-'+Math.floor(Math.random()*100);
+  try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:v,limit_unit:u})});if(!r.ok)throw 0;toast('Created: '+n);await loadLinks();await loadStats();}catch(e){toast('Error',true)}
 }
-
+function showAddMo(){$m('mo-add').classList.add('show')}
 async function createLink(){
-  const label=$('#new-label').value.trim()||'New Link';
-  const val=parseFloat($('#new-limit').value)||0;
-  const unit='GB';
-  const maxconn=parseInt($('#new-maxconn').value)||0;
-  const days=parseInt($('#new-days').value)||0;
+  const label=$m('nl').value.trim()||'New Link';
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+  const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;
   try{
-    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:val,limit_unit:unit,max_connections:maxconn,days_valid:days})});
-    if(!r.ok)throw new Error();
-    toast('Created');
-    $('#new-label').value='';$('#new-limit').value='';$('#new-maxconn').value='';$('#new-days').value='';
-    $('#add-modal').classList.remove('show');
-    await loadLinks();await loadStats();
+    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});
+    if(!r.ok)throw 0;
+    toast('Created');$m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';
+    $m('mo-add').classList.remove('show');await loadLinks();await loadStats();
   }catch(e){toast('Error',true)}
 }
-
-async function resetUsage(uid){try{await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');await loadLinks();}catch(e){}}
-async function deleteLink(uid){if(!confirm('Delete this inbound?'))return;try{await fetch(`/api/links/${uid}`,{method:'DELETE'});toast('Deleted');await loadLinks();await loadStats();}catch(e){}}
-
-function showEditModal(uid){
+function showEditMo(uid){
   const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
-  $('#edit-uid').value=uid;
-  $('#edit-name').value=l.label;
-  const gb=l.limit_bytes/1073741824;
-  $('#edit-limit').value=l.limit_bytes>0?gb:'';
-  $('#edit-unit').value='GB';
-  $('#edit-maxconn').value=l.max_connections>0?l.max_connections:'';
-  $('#edit-days').value='';
-  $('#edit-title').textContent='Edit: '+l.label;
-  $('#edit-modal').classList.add('show');
+  $m('eu').value=uid;$m('en2').value=l.label;
+  $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
+  $m('ec').value=l.max_connections>0?l.max_connections:'';$m('ed').value='';
+  $m('et').textContent='EDIT: '+l.label;$m('mo-edit').classList.add('show');
 }
-
 async function saveEdit(){
-  const uid=$('#edit-uid').value;
-  const val=parseFloat($('#edit-limit').value)||0;
-  const unit=$('#edit-unit').value;
-  const maxconn=parseInt($('#edit-maxconn').value)||0;
-  const days=parseInt($('#edit-days').value)||0;
-  const body={limit_value:val,limit_unit:unit,max_connections:maxconn};
-  if(days>0)body.days_valid=days;
+  const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;
+  const body={limit_value:v,limit_unit:'GB',max_connections:mc};if(days>0)body.days_valid=days;
+  try{const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw 0;toast('Updated');$m('mo-edit').classList.remove('show');await loadLinks();}catch(e){toast('Error',true)}
+}
+async function resetTraf(){
+  const uid=$m('eu').value;if(!confirm('Reset traffic?'))return;
+  try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');await loadLinks();}catch(e){}
+}
+async function delLink(uid){if(!confirm('Delete this inbound?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');await loadLinks();await loadStats();}catch(e){}}
+function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true))}
+async function cpSub(uid){try{await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}catch(e){toast('Failed',true)}}
+function showQR(txt){if(!txt)return;$m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show')}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='luffy-qr.png';a.click()}
+
+async function loadStats(){
   try{
-    const r=await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok)throw new Error();
-    toast('Updated');
-    $('#edit-modal').classList.remove('show');
-    await loadLinks();
-  }catch(e){toast('Error',true)}
-}
-
-async function resetEditTraffic(){
-  const uid=$('#edit-uid').value;
-  if(!confirm('Reset traffic usage to zero?'))return;
-  try{
-    const r=await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});
-    if(!r.ok)throw new Error();
-    toast('Traffic reset');
-    await loadLinks();
-  }catch(e){toast('Error',true)}
-}
-
-function showDetail(uid){
-  const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
-  const u=l.used_bytes,lim=l.limit_bytes;const uF=fmtBytes(u);const lF=fmtLimit(lim);
-  const pct=lim>0?Math.min(100,(u/lim)*100):0;const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
-  const created=l.created_at?new Date(l.created_at).toLocaleString(lang==='fa'?'fa-IR':'en-US'):'--';
-  $('#detail-title').textContent=l.label;
-  $('#detail-content').innerHTML=`
-    <div class="detail-row">
-      <div class="detail-col"><div class="detail-label">Protocol</div><div class="detail-value" style="font-family:inherit"><span class="tag tag-vless">VLESS</span></div></div>
-      <div class="detail-col"><div class="detail-label">Status</div><div class="detail-value" style="font-family:inherit"><span class="tag ${l.active?'tag-active':'tag-disabled'}">${l.active?'Active':'Disabled'}</span></div></div>
-    </div>
-    <div style="margin-bottom:12px"><div class="detail-label">UUID</div><div class="detail-value">${l.uuid}</div></div>
-    <div class="detail-row">
-      <div class="detail-col"><div class="detail-label">Used</div><div class="detail-value">${uF}</div></div>
-      <div class="detail-col"><div class="detail-label">Limit</div><div class="detail-value">${lF}</div></div>
-      <div class="detail-col"><div class="detail-label">Usage</div><div class="detail-value">${pct.toFixed(1)}%</div></div>
-    </div>
-    <div class="sys-bar" style="margin-bottom:12px"><div class="sys-bar-fill" style="width:${pct}%;background:${col}"></div></div>
-    <div class="detail-row">
-      <div class="detail-col"><div class="detail-label">Connected IPs</div><div class="detail-value">${l.current_connections||0} / ${l.max_connections||'Unlimited'}</div></div>
-      <div class="detail-col"><div class="detail-label">Created</div><div class="detail-value" style="font-family:inherit">${created}</div></div>
-    </div>
-    <div style="margin-bottom:12px"><div class="detail-label">Expiry</div><div class="detail-value" style="font-family:inherit">${l.expires_at?new Date(l.expires_at).toLocaleString(lang==='fa'?'fa-IR':'en-US'):'Unlimited'}</div></div>
-    <div style="margin-bottom:0"><div class="detail-label">VLESS Link</div><div class="detail-value">${esc(l.vless_link)}</div></div>
-    <div class="detail-actions">
-      <button class="btn-copy" onclick="copyAllConfigs('${l.uuid}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px;font-size:12px">Copy All</button>
-      <button class="btn-qr" onclick="showQRText('${esc(l.vless_link)}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px;font-size:12px">QR Code</button>
-      <button class="btn btn-secondary btn-sm" onclick="copySubLink('${l.uuid}')" style="padding:8px 18px;font-size:12px">Subscription URL</button>
-      <button class="btn btn-secondary btn-sm" onclick="resetUsage('${l.uuid}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px">Reset Traffic</button>
-    </div>`;
-  $('#detail-modal').classList.add('show');
-}
-
-function copyLinkText(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied to clipboard')).catch(()=>toast('Failed to copy',true))}
-function showQRText(txt){if(!txt)return;const box=document.querySelector('.qr-box');box.classList.remove('animate-in','animate-glow');$('#qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(txt);$('#qr-modal').classList.add('show');requestAnimationFrame(()=>{box.classList.add('animate-in');setTimeout(()=>box.classList.add('animate-glow'),500)})}
-function downloadQR(){const img=$('#qr-img');if(!img.src)return;const a=document.createElement('a');a.href=img.src;a.download='ren-qr.png';a.click()}
-async function copySubLink(uid){
-  try{
-    const domain=location.host;
-    const subUrl=`https://${domain}/sub/${uid}`;
-    await navigator.clipboard.writeText(subUrl);
-    toast('Subscription URL copied');
-  }catch(e){toast('Failed to copy',true)}
-}
-
-async function copyAllConfigs(uid){
-  const l=allLinks.find(x=>x.uuid===uid);
-  if(!l){toast('Not found',true);return;}
-  navigator.clipboard.writeText(l.vless_link).then(()=>toast('Config copied')).catch(()=>toast('Failed',true));
-}
-
-async function changePassword(){
-  const cur=$('#cur-pw').value;const nw=$('#new-pw').value;
-  if(!cur||!nw){toast('Fill all fields',true);return;}
-  try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}toast('Updated');$('#cur-pw').value='';$('#new-pw').value='';}catch(e){toast(e.message,true)}
-}
-
-applyTheme(theme);setLang(lang);
-loadStats();loadLinks();loadAddresses();
-setInterval(()=>{loadStats()},10000);
-
-let allAddresses=[];
-
-async function loadAddresses(){
-  try{
-    const r=await fetch('/api/addresses');
-    if(!r.ok)throw new Error();
-    const d=await r.json();
-    allAddresses=d.addresses||[];
-    renderAddresses();
+    const r=await fetch('/stats');if(!r.ok)throw 0;sData=await r.json();
+    $m('sv-traffic').innerHTML=sData.total_traffic_mb+'<span class="stat-unit"> MB</span>';
+    $m('sv-links').textContent=sData.links_count;
+    $m('sv-uptime').textContent=sData.uptime;
+    $m('sv-domain').textContent=sData.domain;
+    $m('nb').textContent=sData.links_count;
+    $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
+    if($m('t-tr'))$m('t-tr').textContent=sData.total_traffic_mb+' MB';
+    if($m('t-rq'))$m('t-rq').textContent=(sData.total_requests||0).toLocaleString();
+    if($m('t-up'))$m('t-up').textContent=sData.uptime;
+    if(sData.cpu_percent!==undefined){const c=sData.cpu_percent,cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--gold)';$m('cpu-v').textContent=c.toFixed(1)+'%';$m('cpu-v').style.color=cc;$m('cpu-b').style.width=c+'%';$m('cpu-b').style.background=cc}
+    if(sData.memory_percent!==undefined){const m=sData.memory_percent,mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';$m('mem-v').textContent=m.toFixed(1)+'%';$m('mem-v').style.color=mc;$m('mem-b').style.width=m+'%';$m('mem-b').style.background=mc}
+    updChart();
   }catch(e){}
 }
-
-function renderAddresses(){
-  const list=$('#address-list');if(!list)return;
-  if(!allAddresses.length){list.innerHTML='<div style="color:var(--text3);font-size:12px;padding:8px 0">No addresses added</div>';return;}
-  list.innerHTML=allAddresses.map((a,i)=>`
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px">
-      <div style="display:flex;align-items:center;gap:10px">
-        <span style="font-size:14px">🌐</span>
-        <div>
-          <div style="font-size:13px;font-weight:600;color:var(--text)">${esc(a)}</div>
-          <div style="font-size:10px;color:var(--text3)">Address #${i+1}</div>
-        </div>
-      </div>
-      <button class="btn btn-danger btn-sm" onclick="deleteAddress(${i})" style="padding:4px 10px">x</button>
-    </div>
-  `).join('');
+async function loadLinks(){try{const r=await fetch('/api/links');if(!r.ok)throw 0;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){}}
+async function chgPw(){
+  const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill all fields',true);return;}
+  try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}toast('Password updated');$m('cpw').value='';$m('npw').value='';}catch(e){toast(e.message,true)}
 }
 
-function showAddAddressModal(){$('#new-address').value='';$('#add-address-modal').classList.add('show')}
-
-async function addAddresses(){
-  const text=$('#new-address').value.trim();
-  if(!text){toast('Enter at least one IP or domain',true);return;}
-  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l);
-  let added=0;let errors=0;
-  for(const addr of lines){
-    if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){errors++;continue;}
-    try{
-      const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
-      if(r.ok)added++;else errors++;
-    }catch(e){errors++;}
-  }
-  if(added>0)toast(`Added ${added} address(es)`);
-  if(errors>0)toast(`${errors} failed`,true);
-  if(added>0){$('#add-address-modal').classList.remove('show');await loadAddresses();}
-}
-
-async function deleteAddress(index){
-  if(!confirm('Delete this address?'))return;
-  try{
-    const r=await fetch(`/api/addresses/${index}`,{method:'DELETE'});
-    if(!r.ok)throw new Error();
-    toast('Deleted');
-    await loadAddresses();
-  }catch(e){toast('Error',true)}
-}
-
-let allAddresses2=[];
-
-let chartLabels=[];let chartData=[];
+/* Chart */
 function initChart(){
-  const ctx=document.getElementById('trafficChart');if(!ctx)return;
-  trafficChart=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(220,38,38,0.7)',borderColor:'#dc2626',borderWidth:1,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(255,255,255,0.3)',font:{size:10}}},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'rgba(255,255,255,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}}}});
+  const ctx=$m('tc');if(!ctx)return;
+  tChart=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(255,215,0,0.55)',borderColor:'#FFD700',borderWidth:1,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(255,215,0,0.3)',font:{size:9}}},y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(255,215,0,0.3)',font:{size:9},callback:v=>v+' MB'},beginAtZero:true}}}});
+}
+function updChart(){
+  if(!tChart||!sData.hourly_traffic)return;
+  const e=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
+  tChart.data.labels=e.map(x=>x[0]);tChart.data.datasets[0].data=e.map(x=>Math.round(x[1]/1048576));tChart.update();
 }
 initChart();
-function updateChart(){
-  if(!trafficChart||!statsData.hourly_traffic)return;
-  const ht=statsData.hourly_traffic;
-  const sorted=Object.entries(ht).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
-  const labels=sorted.map(e=>e[0]);
-  const data=sorted.map(e=>Math.round(e[1]/1048576));
-  trafficChart.data.labels=labels;trafficChart.data.datasets[0].data=data;
-  trafficChart.update();
+
+/* Addresses */
+async function loadAddrs(){try{const r=await fetch('/api/addresses');if(!r.ok)throw 0;const d=await r.json();allAddrs=d.addresses||[];renderAddrs();}catch(e){}}
+function renderAddrs(){
+  const el=$m('addr-list');if(!el)return;
+  if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:11px">No addresses added</div>';return;}
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;margin-bottom:6px">
+    <div style="display:flex;align-items:center;gap:9px">
+      <span style="color:var(--gold);font-size:13px">🌐</span>
+      <div><div style="font-size:12.5px;font-weight:600">${esc(a)}</div><div style="font-size:9.5px;color:var(--text3)">Address #${i+1}</div></div>
+    </div>
+    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+  </div>`).join('');
 }
+function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show')}
+async function addAddrs(){
+  const lines=($m('na').value||'').trim().split('\n').map(l=>l.trim()).filter(l=>l);
+  let ok=0,fail=0;
+  for(const a of lines){if(!/^[a-zA-Z0-9\-_. ]+$/.test(a)){fail++;continue;}try{const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a})});if(r.ok)ok++;else fail++;}catch(e){fail++;}}
+  if(ok)toast('Added '+ok);if(fail)toast(fail+' failed',true);
+  if(ok){$m('mo-addr').classList.remove('show');await loadAddrs();}
+}
+async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch(e){toast('Error',true)}}
+
+setLang(lang);
+loadStats();loadLinks();loadAddrs();
+setInterval(loadStats,12000);
 </script>
 </body>
 </html>"""
+
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1848,14 +1255,12 @@ async def login_page(request: Request):
         return RedirectResponse(url="/dashboard")
     return HTMLResponse(content=LOGIN_HTML)
 
-
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not await is_valid_session(token):
         return RedirectResponse(url="/login")
     return HTMLResponse(content=DASHBOARD_HTML)
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
