@@ -534,7 +534,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                     if not has_other:
                         remove_ip_from_link(uid, ip)
 
-
+LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
